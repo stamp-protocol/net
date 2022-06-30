@@ -15,7 +15,7 @@ use libp2p::{
         IdentTopic, MessageAuthenticity, ValidationMode,
     },
     identify::{Identify, IdentifyConfig, IdentifyEvent},
-    identity,
+    identity::{self, Keypair},
     kad::{
         record::{
             store::{MemoryStore, MemoryStoreConfig},
@@ -122,9 +122,8 @@ impl From<RelayClientEvent> for StampEvent {
     }
 }
 
-fn setup() -> Result<Swarm<StampBehavior>, Box<dyn Error>> {
+fn setup(local_key: Keypair) -> Result<Swarm<StampBehavior>, Box<dyn Error>> {
     // Create a random PeerId
-    let local_key = identity::Keypair::generate_ed25519();
     let local_pubkey = local_key.public();
     let local_peer_id = PeerId::from(local_key.public());
     info!("Local peer id: {:?}", local_peer_id);
@@ -239,6 +238,7 @@ async fn run(mut swarm: Swarm<StampBehavior>, incoming: Receiver<Command>, outgo
                         }
                         _ => {}
                     }
+                    // we catch this on response and add providers
                     swarm.behaviour_mut().kad.get_providers(key.clone());
                 }
                 Ok(Command::TopicUnsubscribe { topic: name }) => {
@@ -323,15 +323,41 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .short('m')
             .long("message")
             .takes_value(true)
-            .help("A message to send on the main topic."));
+            .help("A message to send on the main topic."))
+        .arg(Arg::with_name("message-delay")
+            .short('d')
+            .long("message-delay")
+            .takes_value(true)
+            .value_parser(clap::value_parser!(u64))
+            .help("A message to send on the main topic."))
+        .arg(Arg::with_name("seed")
+            .short('s')
+            .long("seed")
+            .takes_value(true)
+            .value_parser(clap::value_parser!(u8))
+            .help("A seed value (0-255) to initiate the private key"));
     let args = app.get_matches();
     let listen_addr = args.value_of("listen").expect("listen arg");
     let bootstrap_nodes = args.values_of("bootstrap")
         .map(|b| b.collect::<Vec<_>>())
         .unwrap_or_else(|| Vec::new());
     let message = args.value_of("message");
+    let message_delay: u64 = args.get_one("message-delay").map(|x| *x).unwrap_or(15);
+    let seed: Option<&u8> = args.get_one("seed");
 
-    let mut swarm = setup()?;
+    fn generate_key(seed: u8) -> Keypair {
+        let mut bytes = [0u8; 32];
+        bytes[0] = seed;
+
+        let secret_key = identity::ed25519::SecretKey::from_bytes(&mut bytes)
+            .expect("this returns `Err` only if the length is wrong; the length is correct; qed");
+        Keypair::Ed25519(secret_key.into())
+    }
+
+    let local_key = seed
+        .map(|s| generate_key(*s))
+        .unwrap_or_else(|| Keypair::generate_ed25519());
+    let mut swarm = setup(local_key)?;
     swarm.listen_on(listen_addr.parse()?)?;
     for node in bootstrap_nodes {
         let address: Multiaddr = node.parse()?;
@@ -359,9 +385,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
 
     if let Some(msg) = message {
-        task::sleep(Duration::from_secs(1)).await;
-        incoming_send.send(Command::TopicSubscribe { topic: "chatter".into() }).await?;
         task::sleep(Duration::from_secs(5)).await;
+        incoming_send.send(Command::TopicSubscribe { topic: "chatter".into() }).await?;
+        task::sleep(Duration::from_secs(message_delay)).await;
         incoming_send.send(Command::TopicSend { topic: "chatter".into(), message: Vec::from(msg.as_bytes()) }).await?;
     }
 
