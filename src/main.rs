@@ -255,6 +255,12 @@ async fn run(mut swarm: Swarm<StampBehavior>, incoming: Receiver<Command>, outgo
                 SwarmEvent::Behaviour(StampEvent::Identify(IdentifyEvent::Received { peer_id, info })) => {
                     info!("identify: new peer: {} -- {:?}", peer_id, info.listen_addrs);
                     for addr in info.listen_addrs {
+                        match swarm.dial(addr.clone()) {
+                            Ok(_) => {}
+                            Err(err) => {
+                                outgoing!{ Event::Error(SError::Custom(format!("identify: new peer: failed to dial: {:?}", err))) }
+                            }
+                        }
                         swarm.behaviour_mut().kad.add_address(&peer_id, addr);
                     }
                     if !kad_has_bootstrapped {
@@ -270,6 +276,9 @@ async fn run(mut swarm: Swarm<StampBehavior>, incoming: Receiver<Command>, outgo
                 }
                 SwarmEvent::Behaviour(StampEvent::Kad(KademliaEvent::OutboundQueryCompleted {id: _id, result: QueryResult::GetProviders(Ok(res)), stats: _stats})) => {
                     for provider in res.providers.iter() {
+                        if provider == swarm.local_peer_id() {
+                            continue;
+                        }
                         info!("gossip: add peer from kad: {:?} -- {:?}", res.key, provider);
                         swarm.behaviour_mut().gossipsub.add_explicit_peer(&provider);
                         let peers = swarm.connected_peers()
