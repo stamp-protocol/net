@@ -299,11 +299,11 @@ async fn run(mut swarm: Swarm<StampBehavior>, incoming: Receiver<Command>, outgo
                 SwarmEvent::Behaviour(any) => {
                     info!("oh behave: {:?}", any);
                 }
-                SwarmEvent::ConnectionEstablished { peer_id, .. } => {
-                    info!("swarm: connection opened: {}", peer_id);
+                SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
+                    info!("swarm: connection opened: {} -- {:?}", peer_id, endpoint);
                 }
-                SwarmEvent::ConnectionClosed { peer_id, .. } => {
-                    info!("swarm: connection closed: {}", peer_id);
+                SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
+                    info!("swarm: connection closed: {} -- {:?}", peer_id, cause);
                     swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
                 }
                 SwarmEvent::NewListenAddr { address, .. } => {
