@@ -57,7 +57,6 @@ pub enum SError {
 }
 
 enum Command {
-    TopicAddProviders { providers: Vec<PeerId> },
     TopicSend { topic: String, message: Vec<u8> },
     TopicSubscribe { topic: String },
     TopicUnsubscribe { topic: String },
@@ -67,6 +66,7 @@ enum Command {
 #[derive(Debug)]
 enum Event {
     Error(SError),
+    Quit,
 }
 
 #[derive(Debug)]
@@ -210,11 +210,6 @@ async fn run(mut swarm: Swarm<StampBehavior>, incoming: Receiver<Command>, outgo
     loop {
         select! {
             cmd = incoming.recv().fuse() => match cmd {
-                Ok(Command::TopicAddProviders { providers }) => {
-                    for provider in providers {
-                        swarm.behaviour_mut().gossipsub.add_explicit_peer(&provider);
-                    }
-                }
                 Ok(Command::TopicSend { topic: name, message }) => {
                     let topic = IdentTopic::new(name.as_str());
                     let len = message.len();
@@ -250,6 +245,7 @@ async fn run(mut swarm: Swarm<StampBehavior>, incoming: Receiver<Command>, outgo
                     }
                 }
                 Ok(Command::Quit) => {
+                    outgoing! { Event::Quit }
                     break;
                 }
                 _ => {}
@@ -361,11 +357,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
     swarm.listen_on(listen_addr.parse()?)?;
     for node in bootstrap_nodes {
         let address: Multiaddr = node.parse()?;
-        let circuit_addr = address.clone().with(Protocol::P2pCircuit);
-        swarm.listen_on(circuit_addr)?;
+        if address.iter().find(|p| p == &Protocol::P2pCircuit).is_none() {
+            let circuit_addr = address.clone().with(Protocol::P2pCircuit);
+            info!("Creating circuit relay listener: {:?}", circuit_addr);
+            swarm.listen_on(circuit_addr)?;
+        }
         match swarm.dial(address.clone()) {
-            Ok(_) => println!("Dialed {:?}", address),
-            Err(e) => println!("Dial {:?} failed: {:?}", address, e),
+            Ok(_) => info!("Dialed {:?}", address),
+            Err(e) => error!("Dial {:?} failed: {:?}", address, e),
         };
     }
 
@@ -379,6 +378,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let event = outgoing_recv.recv().await
                 .map_err(|e| SError::Custom(format!("failed to recv event: {:?}", e)))?;
             info!("event: {:?}", event);
+            match event {
+                Event::Quit => { break; }
+                _ => {}
+            }
         }
         Ok::<(), SError>(())
     });
