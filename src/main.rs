@@ -145,7 +145,8 @@ fn setup(local_key: Keypair) -> Result<Swarm<StampBehavior>, Box<dyn Error>> {
     };
 
     let identify = {
-        let config = IdentifyConfig::new("stampnet/1.0.0".into(), local_pubkey);
+        let config = IdentifyConfig::new("stampnet/1.0.0".into(), local_pubkey)
+            .with_push_listen_addr_updates(true);
         Identify::new(config)
     };
 
@@ -271,6 +272,25 @@ async fn run(mut swarm: Swarm<StampBehavior>, incoming: Receiver<Command>, outgo
                     for provider in res.providers.iter() {
                         info!("gossip: add peer from kad: {:?} -- {:?}", res.key, provider);
                         swarm.behaviour_mut().gossipsub.add_explicit_peer(&provider);
+                        let peers = swarm.connected_peers()
+                            .map(|x| x.clone())
+                            .collect::<Vec<_>>();
+                        for peer in peers {
+                            if &peer == provider {
+                                continue;
+                            }
+                            let addr = Multiaddr::empty()
+                                .with(Protocol::P2p(peer.as_ref().clone()))
+                                .with(Protocol::P2pCircuit)
+                                .with(Protocol::P2p(provider.as_ref().clone()));
+                            info!("gossip: dialing {:?}", addr);
+                            match swarm.dial(addr.clone()) {
+                                Ok(_) => {}
+                                Err(err) => {
+                                    outgoing!{ Event::Error(SError::Custom(format!("gossip: failed to dial {:?}: {:?}", addr, err))) }
+                                }
+                            }
+                        }
                     }
                 }
                 SwarmEvent::Behaviour(StampEvent::Ping(ev)) => {
