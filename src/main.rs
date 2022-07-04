@@ -29,7 +29,10 @@ use libp2p::{
         client::{Client as RelayClient, Event as RelayClientEvent},
         relay::{Config as RelayConfig, Event as RelayEvent, Relay},
     },
-    swarm::{Swarm, SwarmEvent},
+    swarm::{
+        behaviour::toggle::Toggle,
+        Swarm, SwarmEvent,
+    },
     Multiaddr,
     NetworkBehaviour,
     PeerId,
@@ -42,13 +45,13 @@ use std::time::Duration;
 #[derive(NetworkBehaviour)]
 #[behaviour(out_event = "StampEvent")]
 struct StampBehavior {
-    dcutr: Dcutr,
+    dcutr: Toggle<Dcutr>,
     gossipsub: Gossipsub,
     identify: Identify,
     kad: Kademlia<MemoryStore>,
     ping: Ping,
-    relay: Relay,
-    relay_client: RelayClient,
+    relay_client: Toggle<RelayClient>,
+    relay: Toggle<Relay>,
 }
 
 #[derive(Debug)]
@@ -122,7 +125,7 @@ impl From<RelayClientEvent> for StampEvent {
     }
 }
 
-fn setup(local_key: Keypair) -> Result<Swarm<StampBehavior>, Box<dyn Error>> {
+fn setup(local_key: Keypair, public: bool) -> Result<Swarm<StampBehavior>, Box<dyn Error>> {
     // Create a random PeerId
     let local_pubkey = local_key.public();
     let local_peer_id = PeerId::from(local_key.public());
@@ -132,7 +135,7 @@ fn setup(local_key: Keypair) -> Result<Swarm<StampBehavior>, Box<dyn Error>> {
         .into_authentic(&local_key)?;
 
     let dcutr = {
-        Dcutr::new()
+        Toggle::from(if public { None } else { Some(Dcutr::new()) })
     };
 
     // Create a Swarm to manage peers and events
@@ -167,12 +170,22 @@ fn setup(local_key: Keypair) -> Result<Swarm<StampBehavior>, Box<dyn Error>> {
     };
 
     let relay = {
-        let config = RelayConfig::default();
-        Relay::new(local_peer_id.clone(), config)
+        if public {
+            info!("setup() -- creating relay behavior");
+            let config = RelayConfig::default();
+            Toggle::from(Some(Relay::new(local_peer_id.clone(), config)))
+        } else {
+            Toggle::from(None)
+        }
     };
 
     let (relay_transport, relay_client) = {
-        RelayClient::new_transport_and_behaviour(local_peer_id.clone())
+        if public {
+            (None, Toggle::from(None))
+        } else {
+            let (relay_transport, relay_client) = RelayClient::new_transport_and_behaviour(local_peer_id.clone());
+            (Some(relay_transport), Toggle::from(Some(relay_client)))
+        }
     };
 
     let behavior = StampBehavior {
@@ -187,12 +200,19 @@ fn setup(local_key: Keypair) -> Result<Swarm<StampBehavior>, Box<dyn Error>> {
 
     let tcp_transport = libp2p::tcp::TcpConfig::new()
         .port_reuse(true);
-    let transport = OrTransport::new(relay_transport, tcp_transport)
-        .upgrade(libp2p::core::upgrade::Version::V1)
-        .authenticate(libp2p::noise::NoiseConfig::xx(noise_keys).into_authenticated())
-        .multiplex(libp2p::yamux::YamuxConfig::default())
-        .boxed();
-
+    let transport = if let Some(relay_transport) = relay_transport {
+        OrTransport::new(relay_transport, tcp_transport)
+            .upgrade(libp2p::core::upgrade::Version::V1)
+            .authenticate(libp2p::noise::NoiseConfig::xx(noise_keys).into_authenticated())
+            .multiplex(libp2p::yamux::YamuxConfig::default())
+            .boxed()
+    } else {
+        tcp_transport
+            .upgrade(libp2p::core::upgrade::Version::V1)
+            .authenticate(libp2p::noise::NoiseConfig::xx(noise_keys).into_authenticated())
+            .multiplex(libp2p::yamux::YamuxConfig::default())
+            .boxed()
+    };
     let swarm = libp2p::swarm::SwarmBuilder::new(transport, behavior, local_peer_id)
         .build();
     Ok(swarm)
@@ -255,12 +275,6 @@ async fn run(mut swarm: Swarm<StampBehavior>, incoming: Receiver<Command>, outgo
                 SwarmEvent::Behaviour(StampEvent::Identify(IdentifyEvent::Received { peer_id, info })) => {
                     info!("identify: new peer: {} -- {:?}", peer_id, info.listen_addrs);
                     for addr in info.listen_addrs {
-                        match swarm.dial(addr.clone()) {
-                            Ok(_) => {}
-                            Err(err) => {
-                                outgoing!{ Event::Error(SError::Custom(format!("identify: new peer: failed to dial: {:?}", err))) }
-                            }
-                        }
                         swarm.behaviour_mut().kad.add_address(&peer_id, addr);
                     }
                     if !kad_has_bootstrapped {
@@ -281,23 +295,14 @@ async fn run(mut swarm: Swarm<StampBehavior>, incoming: Receiver<Command>, outgo
                         }
                         info!("gossip: add peer from kad: {:?} -- {:?}", res.key, provider);
                         swarm.behaviour_mut().gossipsub.add_explicit_peer(&provider);
-                        let peers = swarm.connected_peers()
-                            .map(|x| x.clone())
-                            .collect::<Vec<_>>();
-                        for peer in peers {
-                            if &peer == provider {
-                                continue;
-                            }
-                            let addr = Multiaddr::empty()
-                                .with(Protocol::P2p(peer.as_ref().clone()))
-                                .with(Protocol::P2pCircuit)
-                                .with(Protocol::P2p(provider.as_ref().clone()));
-                            info!("gossip: dialing {:?}", addr);
-                            match swarm.dial(addr.clone()) {
-                                Ok(_) => {}
-                                Err(err) => {
-                                    outgoing!{ Event::Error(SError::Custom(format!("gossip: failed to dial {:?}: {:?}", addr, err))) }
-                                }
+                        let addr = Multiaddr::empty()
+                            .with(Protocol::P2pCircuit)
+                            .with(Protocol::P2p(provider.as_ref().clone()));
+                        info!("gossip: dialing {:?}", addr);
+                        match swarm.dial(addr.clone()) {
+                            Ok(_) => {}
+                            Err(err) => {
+                                outgoing!{ Event::Error(SError::Custom(format!("gossip: failed to dial {:?}: {:?}", addr, err))) }
                             }
                         }
                     }
@@ -338,6 +343,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .takes_value(true)
             .default_value("/ip4/0.0.0.0/tcp/0")
             .help("A MultiAddr listen address"))
+        .arg(Arg::with_name("public")
+            .short('p')
+            .long("public")
+            .takes_value(false)
+            .help("Sets this instance to public (acts as a relay)"))
         .arg(Arg::with_name("bootstrap")
             .short('b')
             .long("bootstrap")
@@ -363,6 +373,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .help("A seed value (0-255) to initiate the private key"));
     let args = app.get_matches();
     let listen_addr = args.value_of("listen").expect("listen arg");
+    let public = args.is_present("public");
     let bootstrap_nodes = args.values_of("bootstrap")
         .map(|b| b.collect::<Vec<_>>())
         .unwrap_or_else(|| Vec::new());
@@ -382,11 +393,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let local_key = seed
         .map(|s| generate_key(*s))
         .unwrap_or_else(|| Keypair::generate_ed25519());
-    let mut swarm = setup(local_key)?;
+    let mut swarm = setup(local_key, public)?;
     swarm.listen_on(listen_addr.parse()?)?;
     for node in bootstrap_nodes {
         let address: Multiaddr = node.parse()?;
-        if address.iter().find(|p| p == &Protocol::P2pCircuit).is_none() {
+        if !public && address.iter().find(|p| p == &Protocol::P2pCircuit).is_none() {
             let circuit_addr = address.clone().with(Protocol::P2pCircuit);
             info!("Creating circuit relay listener: {:?}", circuit_addr);
             swarm.listen_on(circuit_addr)?;
