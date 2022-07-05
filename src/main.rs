@@ -141,9 +141,12 @@ fn setup(local_key: Keypair, public: bool) -> Result<Swarm<StampBehavior>, Box<d
     // Create a Swarm to manage peers and events
     let gossipsub = {
         // Set a custom gossipsub
-        let config = GossipsubConfigBuilder::default()
-            .validation_mode(ValidationMode::Strict)
-            .build()?;
+        let mut builder = GossipsubConfigBuilder::default();
+        builder.validation_mode(ValidationMode::Strict);
+        if public {
+            builder.do_px();
+        }
+        let config = builder.build()?;
         Gossipsub::new(MessageAuthenticity::Signed(local_key), config)?
     };
 
