@@ -48,7 +48,7 @@ use std::time::Duration;
 #[derive(NetworkBehaviour)]
 #[behaviour(out_event = "StampEvent")]
 struct StampBehavior {
-    dcutr: Dcutr,
+    dcutr: Toggle<Dcutr>,
     gossipsub: Gossipsub,
     identify: Identify,
     kad: Kademlia<MemoryStore>,
@@ -138,7 +138,7 @@ fn setup(local_key: Keypair, public: bool) -> Result<Swarm<StampBehavior>, Box<d
         .into_authentic(&local_key)?;
 
     let dcutr = {
-        Dcutr::new()
+        Toggle::from(if public { None } else { Some(Dcutr::new()) })
     };
 
     // Create a Swarm to manage peers and events
