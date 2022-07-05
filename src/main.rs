@@ -22,7 +22,7 @@ use libp2p::{
             Key,
         },
         Kademlia, KademliaConfig, KademliaEvent,
-        QueryResult,
+        KademliaStoreInserts, QueryResult,
     },
     ping::{Event as PingEvent, Ping, PingConfig},
     relay::v2::{
@@ -32,6 +32,9 @@ use libp2p::{
     swarm::{
         behaviour::toggle::Toggle,
         Swarm, SwarmEvent,
+    },
+    tcp::{
+        GenTcpConfig, TcpTransport,
     },
     Multiaddr,
     NetworkBehaviour,
@@ -161,6 +164,7 @@ fn setup(local_key: Keypair, public: bool) -> Result<Swarm<StampBehavior>, Box<d
         let store = MemoryStore::with_config(local_peer_id.clone(), store_config);
         let mut config = KademliaConfig::default();
         config.set_protocol_name("/stampnet/syncpub/1.0.0".as_bytes());
+        config.set_record_filtering(KademliaStoreInserts::Unfiltered);    // FilterBoth to enable filtering
         Kademlia::with_config(local_peer_id.clone(), store, config)
     };
 
@@ -201,8 +205,7 @@ fn setup(local_key: Keypair, public: bool) -> Result<Swarm<StampBehavior>, Box<d
         relay_client,
     };
 
-    let tcp_transport = libp2p::tcp::TcpConfig::new()
-        .port_reuse(true);
+    let tcp_transport = TcpTransport::new(GenTcpConfig::new().port_reuse(true));
     let transport = if let Some(relay_transport) = relay_transport {
         OrTransport::new(relay_transport, tcp_transport)
             .upgrade(libp2p::core::upgrade::Version::V1)

@@ -9,7 +9,8 @@ async-std = { version = "1.11", features = ["attributes"] }
 clap = "3.2.5"
 env_logger = "0.9"
 futures = "0.3"
-libp2p = { version = "0.45", features = ["dcutr"] }
+#libp2p = { version = "0.45", features = ["dcutr"] }
+libp2p = { git = "https://github.com/libp2p/rust-libp2p", rev = "62622a1bad70381e56237b4da4d9abcf2b1a0e24", features = ["dcutr"] }
 log = "0.4"
 stamp-core = { path = "../core" }
 
