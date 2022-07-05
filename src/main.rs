@@ -301,14 +301,21 @@ async fn run(mut swarm: Swarm<StampBehavior>, incoming: Receiver<Command>, outgo
                         }
                         info!("gossip: add peer from kad: {:?} -- {:?}", res.key, provider);
                         swarm.behaviour_mut().gossipsub.add_explicit_peer(&provider);
-                        let addr = Multiaddr::empty()
-                            .with(Protocol::P2pCircuit)
-                            .with(Protocol::P2p(provider.as_ref().clone()));
-                        info!("gossip: dialing {:?}", addr);
-                        match swarm.dial(addr.clone()) {
-                            Ok(_) => {}
-                            Err(err) => {
-                                outgoing!{ Event::Error(SError::Custom(format!("gossip: failed to dial {:?}: {:?}", addr, err))) }
+                        let addresses = swarm.connected_peers()
+                            .map(|p| {
+                                Multiaddr::empty()
+                                    .with(Protocol::P2p(p.as_ref().clone()))
+                                    .with(Protocol::P2pCircuit)
+                                    .with(Protocol::P2p(provider.as_ref().clone()))
+                            })
+                            .collect::<Vec<_>>();
+                        for addr in addresses {
+                            info!("gossip: dialing {:?}", addr);
+                            match swarm.dial(addr.clone()) {
+                                Ok(_) => {}
+                                Err(err) => {
+                                    outgoing!{ Event::Error(SError::Custom(format!("gossip: failed to dial {:?}: {:?}", addr, err))) }
+                                }
                             }
                         }
                     }
