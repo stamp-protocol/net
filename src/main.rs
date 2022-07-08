@@ -72,6 +72,7 @@ enum Command {
 
 #[derive(Debug)]
 enum Event {
+    DiscoveryReady,
     Error(SError),
     Quit,
 }
@@ -322,6 +323,12 @@ async fn run(mut swarm: Swarm<StampBehavior>, incoming: Receiver<Command>, outgo
                         }
                     }
                 }
+                SwarmEvent::Behaviour(StampEvent::Kad(KademliaEvent::OutboundQueryCompleted {id: _id, result: QueryResult::Bootstrap(Ok(res)), stats: _stats})) => {
+                    if res.num_remaining == 0 {
+                        info!("kad: bootstrapping complete");
+                        outgoing!{ Event::DiscoveryReady }
+                    }
+                }
                 SwarmEvent::Behaviour(StampEvent::Kad(KademliaEvent::OutboundQueryCompleted {id: _id, result: QueryResult::GetProviders(Ok(res)), stats: _stats})) => {
                     for provider in res.providers.iter() {
                         if provider == swarm.local_peer_id() {
@@ -422,7 +429,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let bootstrap_nodes = args.values_of("bootstrap")
         .map(|b| b.collect::<Vec<_>>())
         .unwrap_or_else(|| Vec::new());
-    let message = args.value_of("message");
+    let message = args.value_of("message").map(|x| String::from(x));
     let message_delay: u64 = args.get_one("message-delay").map(|x| *x).unwrap_or(15);
     let seed: Option<&u8> = args.get_one("seed");
     let psk: Option<&u8> = args.get_one("psk");
@@ -463,20 +470,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 .map_err(|e| SError::Custom(format!("failed to recv event: {:?}", e)))?;
             info!("event: {:?}", event);
             match event {
+                Event::DiscoveryReady => {
+                    if let Some(msg) = message.as_ref() {
+                        task::sleep(Duration::from_secs(5)).await;
+                        incoming_send.send(Command::TopicSubscribe { topic: "chatter".into() }).await
+                            .map_err(|e| SError::Custom(format!("failed to signal swarm: {:?}", e)))?;
+                        task::sleep(Duration::from_secs(message_delay)).await;
+                        incoming_send.send(Command::TopicSend { topic: "chatter".into(), message: Vec::from(msg.as_bytes()) }).await
+                            .map_err(|e| SError::Custom(format!("failed to signal swarm: {:?}", e)))?;
+                    }
+                }
                 Event::Quit => { break; }
                 _ => {}
             }
         }
         Ok::<(), SError>(())
     });
-
-
-    if let Some(msg) = message {
-        task::sleep(Duration::from_secs(5)).await;
-        incoming_send.send(Command::TopicSubscribe { topic: "chatter".into() }).await?;
-        task::sleep(Duration::from_secs(message_delay)).await;
-        incoming_send.send(Command::TopicSend { topic: "chatter".into(), message: Vec::from(msg.as_bytes()) }).await?;
-    }
 
     runner.await.map_err(|_| std::io::Error::from_raw_os_error(1))?;
     events.await.map_err(|_| std::io::Error::from_raw_os_error(1))?;
