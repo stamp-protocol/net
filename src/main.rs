@@ -297,7 +297,10 @@ async fn run(mut swarm: Swarm<StampBehavior>, incoming: Receiver<Command>, outgo
                         swarm.behaviour_mut().kad.add_address(&peer_id, addr.clone());
                     }
                     if info.protocols.iter().find(|p| p.contains("/libp2p/circuit/relay")).is_some() {
-                        for addr in info.listen_addrs.iter().filter(|a| a.iter().find(|m| matches!(m, Protocol::P2p(_))).is_some()) {
+                        let addrs = info.listen_addrs.iter()
+                            .filter(|a| a.iter().find(|m| matches!(m, Protocol::P2p(_))).is_some())
+                            .filter(|a| a.iter().find(|m| matches!(m, Protocol::P2pCircuit)).is_none());
+                        for addr in addrs {
                             let circuit_addr = addr.clone().with(Protocol::P2pCircuit);
                             info!("Creating circuit relay listener: {:?}", circuit_addr);
                             match swarm.listen_on(circuit_addr) {
