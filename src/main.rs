@@ -25,6 +25,7 @@ use libp2p::{
         KademliaStoreInserts, QueryResult,
     },
     ping::{Event as PingEvent, Ping, PingConfig},
+    pnet::{PnetConfig, PreSharedKey},
     relay::v2::{
         client::{Client as RelayClient, Event as RelayClientEvent},
         relay::{Config as RelayConfig, Event as RelayEvent, Relay},
@@ -128,7 +129,7 @@ impl From<RelayClientEvent> for StampEvent {
     }
 }
 
-fn setup(local_key: Keypair, public: bool) -> Result<Swarm<StampBehavior>, Box<dyn Error>> {
+fn setup(local_key: Keypair, public: bool, psk: Option<PreSharedKey>) -> Result<Swarm<StampBehavior>, Box<dyn Error>> {
     // Create a random PeerId
     let local_pubkey = local_key.public();
     let local_peer_id = PeerId::from(local_key.public());
@@ -206,18 +207,30 @@ fn setup(local_key: Keypair, public: bool) -> Result<Swarm<StampBehavior>, Box<d
     };
 
     let tcp_transport = TcpTransport::new(GenTcpConfig::new().port_reuse(true));
+    macro_rules! std_transport {
+        ($trans:expr) => {
+            {
+                $trans
+                    .upgrade(libp2p::core::upgrade::Version::V1)
+                    .authenticate(libp2p::noise::NoiseConfig::xx(noise_keys).into_authenticated())
+                    .multiplex(libp2p::yamux::YamuxConfig::default())
+                    .boxed()
+            }
+        }
+    }
+    macro_rules! std_transport_psk {
+        ($trans: expr) => {
+            if let Some(psk) = psk {
+                std_transport!($trans.and_then(move |socket, _| PnetConfig::new(psk).handshake(socket)))
+            } else {
+                std_transport!($trans)
+            }
+        }
+    }
     let transport = if let Some(relay_transport) = relay_transport {
-        OrTransport::new(relay_transport, tcp_transport)
-            .upgrade(libp2p::core::upgrade::Version::V1)
-            .authenticate(libp2p::noise::NoiseConfig::xx(noise_keys).into_authenticated())
-            .multiplex(libp2p::yamux::YamuxConfig::default())
-            .boxed()
+        std_transport_psk!(OrTransport::new(relay_transport, tcp_transport))
     } else {
-        tcp_transport
-            .upgrade(libp2p::core::upgrade::Version::V1)
-            .authenticate(libp2p::noise::NoiseConfig::xx(noise_keys).into_authenticated())
-            .multiplex(libp2p::yamux::YamuxConfig::default())
-            .boxed()
+        std_transport_psk!(tcp_transport)
     };
     let swarm = libp2p::swarm::SwarmBuilder::new(transport, behavior, local_peer_id)
         .build();
@@ -383,7 +396,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .long("seed")
             .takes_value(true)
             .value_parser(clap::value_parser!(u8))
-            .help("A seed value (0-255) to initiate the private key"));
+            .help("A seed value (0-255) to initiate the private key"))
+        .arg(Arg::with_name("psk")
+            .long("psk")
+            .takes_value(true)
+            .value_parser(clap::value_parser!(u8))
+            .help("A seed value (0-255) to initiate psk communication"));
     let args = app.get_matches();
     let listen_addr = args.value_of("listen").expect("listen arg");
     let public = args.is_present("public");
@@ -393,6 +411,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let message = args.value_of("message");
     let message_delay: u64 = args.get_one("message-delay").map(|x| *x).unwrap_or(15);
     let seed: Option<&u8> = args.get_one("seed");
+    let psk: Option<&u8> = args.get_one("psk");
 
     fn generate_key(seed: u8) -> Keypair {
         let mut bytes = [0u8; 32];
@@ -406,7 +425,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let local_key = seed
         .map(|s| generate_key(*s))
         .unwrap_or_else(|| Keypair::generate_ed25519());
-    let mut swarm = setup(local_key, public)?;
+    let pre_shared_key = psk.map(|seed| PreSharedKey::new([*seed; 32]));
+    let mut swarm = setup(local_key, public, pre_shared_key)?;
     swarm.listen_on(listen_addr.parse()?)?;
     for node in bootstrap_nodes {
         let address: Multiaddr = node.parse()?;
