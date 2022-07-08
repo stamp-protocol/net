@@ -367,7 +367,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .short('l')
             .long("listen")
             .takes_value(true)
-            .default_value("/ip4/0.0.0.0/tcp/0")
             .help("A MultiAddr listen address"))
         .arg(Arg::with_name("public")
             .short('p')
@@ -403,7 +402,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .value_parser(clap::value_parser!(u8))
             .help("A seed value (0-255) to initiate psk communication"));
     let args = app.get_matches();
-    let listen_addr = args.value_of("listen").expect("listen arg");
+    let listen_addr = args.value_of("listen");
     let public = args.is_present("public");
     let bootstrap_nodes = args.values_of("bootstrap")
         .map(|b| b.collect::<Vec<_>>())
@@ -427,10 +426,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .unwrap_or_else(|| Keypair::generate_ed25519());
     let pre_shared_key = psk.map(|seed| PreSharedKey::new([*seed; 32]));
     let mut swarm = setup(local_key, public, pre_shared_key)?;
-    swarm.listen_on(listen_addr.parse()?)?;
+    if let Some(listen_addr) = listen_addr {
+        swarm.listen_on(listen_addr.parse()?)?;
+    }
     for node in bootstrap_nodes {
         let address: Multiaddr = node.parse()?;
-        if !public && address.iter().find(|p| p == &Protocol::P2pCircuit).is_none() {
+        if !public && listen_addr.is_some() && address.iter().find(|p| p == &Protocol::P2pCircuit).is_none() {
             let circuit_addr = address.clone().with(Protocol::P2pCircuit);
             info!("Creating circuit relay listener: {:?}", circuit_addr);
             swarm.listen_on(circuit_addr)?;
