@@ -43,6 +43,7 @@ use libp2p::{
     Transport,
 };
 use log::{error, info, warn, trace};
+use std::collections::HashSet;
 use std::error::Error;
 use std::time::Duration;
 
@@ -298,18 +299,32 @@ async fn run(mut swarm: Swarm<StampBehavior>, incoming: Receiver<Command>, outgo
                         swarm.behaviour_mut().kad.add_address(&peer_id, addr.clone());
                     }
                     if info.protocols.iter().find(|p| p.contains("/libp2p/circuit/relay")).is_some() {
-                        let addrs = info.listen_addrs.iter()
-                            .filter(|a| a.iter().find(|m| matches!(m, Protocol::P2p(_))).is_some())
-                            .filter(|a| a.iter().find(|m| matches!(m, Protocol::P2pCircuit)).is_none());
-                        for addr in addrs {
-                            let circuit_addr = addr.clone().with(Protocol::P2pCircuit);
+                        let mut seen: HashSet<Multiaddr> = HashSet::new();
+                        for addr in info.listen_addrs.iter() {
+                            let has_circuit = addr.iter().find(|m| matches!(m, Protocol::P2pCircuit)).is_some();
+                            if has_circuit {
+                                continue;
+                            }
+                            let has_p2p = addr.iter().find(|m| matches!(m, Protocol::P2p(_))).is_some();
+
+                            let addr = addr.clone();
+                            let addr = if !has_p2p {
+                                addr.with(Protocol::P2p(info.public_key.to_peer_id().as_ref().clone()))
+                            } else {
+                                addr
+                            };
+                            let circuit_addr = addr.with(Protocol::P2pCircuit);
+                            if seen.contains(&circuit_addr) {
+                                continue;
+                            }
                             info!("Creating circuit relay listener: {:?}", circuit_addr);
-                            match swarm.listen_on(circuit_addr) {
+                            match swarm.listen_on(circuit_addr.clone()) {
                                 Ok(_) => {}
                                 Err(_e) => {
                                     outgoing!{ Event::Error(SError::Custom("failed to create swarm circuit listener".into())) }
                                 }
                             }
+                            seen.insert(circuit_addr);
                         }
                     }
                     if !kad_has_bootstrapped {
