@@ -292,9 +292,21 @@ async fn run(mut swarm: Swarm<StampBehavior>, incoming: Receiver<Command>, outgo
             },
             event = swarm.select_next_some() => match event {
                 SwarmEvent::Behaviour(StampEvent::Identify(IdentifyEvent::Received { peer_id, info })) => {
-                    info!("identify: new peer: {} -- {:?}", peer_id, info.listen_addrs);
-                    for addr in info.listen_addrs {
-                        swarm.behaviour_mut().kad.add_address(&peer_id, addr);
+                    info!("identify: new peer: {} -- {:?} -- {:?}", peer_id, info.listen_addrs, info.protocols);
+                    for addr in &info.listen_addrs {
+                        swarm.behaviour_mut().kad.add_address(&peer_id, addr.clone());
+                    }
+                    if info.protocols.iter().find(|p| p.contains("/libp2p/circuit/relay")).is_some() {
+                        for addr in info.listen_addrs.iter().filter(|a| a.iter().find(|m| matches!(m, Protocol::P2p(_))).is_some()) {
+                            let circuit_addr = addr.clone().with(Protocol::P2pCircuit);
+                            info!("Creating circuit relay listener: {:?}", circuit_addr);
+                            match swarm.listen_on(circuit_addr) {
+                                Ok(_) => {}
+                                Err(_e) => {
+                                    outgoing!{ Event::Error(SError::Custom("failed to create swarm circuit listener".into())) }
+                                }
+                            }
+                        }
                     }
                     if !kad_has_bootstrapped {
                         match swarm.behaviour_mut().kad.bootstrap() {
@@ -431,11 +443,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
     for node in bootstrap_nodes {
         let address: Multiaddr = node.parse()?;
-        if !public && listen_addr.is_some() && address.iter().find(|p| p == &Protocol::P2pCircuit).is_none() {
-            let circuit_addr = address.clone().with(Protocol::P2pCircuit);
-            info!("Creating circuit relay listener: {:?}", circuit_addr);
-            swarm.listen_on(circuit_addr)?;
-        }
         match swarm.dial(address.clone()) {
             Ok(_) => info!("Dialed {:?}", address),
             Err(e) => error!("Dial {:?} failed: {:?}", address, e),
