@@ -1,21 +1,19 @@
 use async_std::{
-    channel::{self, Receiver, Sender},
-    task,
+    channel::{Receiver, Sender},
 };
-use clap::{Arg, App};
+pub use crate::error::{Error, Result};
 use futures::{prelude::*, select};
 use libp2p::{
     core::{
         transport::OrTransport,
-        multiaddr::Protocol,
     },
     dcutr::behaviour::{Behaviour as Dcutr, Event as DcutrEvent},
     gossipsub::{
-        Gossipsub, GossipsubConfigBuilder, GossipsubEvent,
+        Gossipsub, GossipsubConfigBuilder, GossipsubEvent, GossipsubMessage,
         IdentTopic, MessageAuthenticity, ValidationMode,
     },
     identify::{Identify, IdentifyConfig, IdentifyEvent},
-    identity::{self, Keypair},
+    identity::{Keypair},
     kad::{
         record::{
             store::{MemoryStore, MemoryStoreConfig},
@@ -24,8 +22,8 @@ use libp2p::{
         Kademlia, KademliaConfig, KademliaEvent,
         KademliaStoreInserts, QueryResult,
     },
-    ping::{Event as PingEvent, Ping, PingConfig},
-    pnet::{PnetConfig, PreSharedKey},
+    multiaddr::{Multiaddr, Protocol},
+    ping::{Event as PingEvent, Ping, PingConfig, PingSuccess},
     relay::v2::{
         client::{Client as RelayClient, Event as RelayClientEvent},
         relay::{Config as RelayConfig, Event as RelayEvent, Relay},
@@ -37,19 +35,37 @@ use libp2p::{
     tcp::{
         GenTcpConfig, TcpTransport,
     },
-    Multiaddr,
     NetworkBehaviour,
     PeerId,
     Transport,
 };
-use log::{error, info, warn, trace};
 use std::collections::HashSet;
-use std::error::Error;
 use std::time::Duration;
+use tracing::{debug, error, info, warn, trace};
+
+#[derive(Debug)]
+pub enum Command {
+    TopicSend { topic: String, message: Vec<u8> },
+    TopicSubscribe { topic: String },
+    TopicUnsubscribe { topic: String },
+    Quit,
+}
+
+#[derive(Debug)]
+pub enum Event {
+    DiscoveryReady,
+    Error(Error),
+    GossipMessage { peer_id: Option<PeerId>, topic: String, data: Vec<u8> },
+    GossipSubscribed { topic: String },
+    GossipUnsubscribed { topic: String },
+    Ping,
+    Pong,
+    Quit,
+}
 
 #[derive(NetworkBehaviour)]
 #[behaviour(out_event = "StampEvent")]
-struct StampBehavior {
+pub struct StampBehavior {
     dcutr: Toggle<Dcutr>,
     gossipsub: Gossipsub,
     identify: Identify,
@@ -60,26 +76,7 @@ struct StampBehavior {
 }
 
 #[derive(Debug)]
-pub enum SError {
-    Custom(String),
-}
-
-enum Command {
-    TopicSend { topic: String, message: Vec<u8> },
-    TopicSubscribe { topic: String },
-    TopicUnsubscribe { topic: String },
-    Quit,
-}
-
-#[derive(Debug)]
-enum Event {
-    DiscoveryReady,
-    Error(SError),
-    Quit,
-}
-
-#[derive(Debug)]
-enum StampEvent {
+pub enum StampEvent {
     Dcutr(DcutrEvent),
     Gossipsub(GossipsubEvent),
     Identify(IdentifyEvent),
@@ -131,7 +128,14 @@ impl From<RelayClientEvent> for StampEvent {
     }
 }
 
-fn setup(local_key: Keypair, public: bool, psk: Option<PreSharedKey>) -> Result<Swarm<StampBehavior>, Box<dyn Error>> {
+/// Generate a new random peer key.
+pub fn random_peer_key() -> Keypair {
+    Keypair::generate_ed25519()
+}
+
+/// Create our listener/processer for the StampNet node.
+#[tracing::instrument(skip(local_key), fields(%public))]
+pub fn setup(local_key: Keypair, public: bool) -> Result<Swarm<StampBehavior>> {
     // Create a random PeerId
     let local_pubkey = local_key.public();
     let local_peer_id = PeerId::from(local_key.public());
@@ -152,13 +156,15 @@ fn setup(local_key: Keypair, public: bool, psk: Option<PreSharedKey>) -> Result<
         if public {
             builder.do_px();
         }
-        let config = builder.build()?;
-        Gossipsub::new(MessageAuthenticity::Signed(local_key), config)?
+        let config = builder.build()
+            .map_err(|x| Error::Gossip(String::from(x)))?;
+        Gossipsub::new(MessageAuthenticity::Signed(local_key), config)
+            .map_err(|x| Error::Gossip(String::from(x)))?
     };
 
     let identify = {
         let config = IdentifyConfig::new("stampnet/1.0.0".into(), local_pubkey)
-            .with_push_listen_addr_updates(true);
+            .with_push_listen_addr_updates(false);
         Identify::new(config)
     };
 
@@ -220,30 +226,23 @@ fn setup(local_key: Keypair, public: bool, psk: Option<PreSharedKey>) -> Result<
             }
         }
     }
-    macro_rules! std_transport_psk {
-        ($trans: expr) => {
-            if let Some(psk) = psk {
-                std_transport!($trans.and_then(move |socket, _| PnetConfig::new(psk).handshake(socket)))
-            } else {
-                std_transport!($trans)
-            }
-        }
-    }
     let transport = if let Some(relay_transport) = relay_transport {
-        std_transport_psk!(OrTransport::new(relay_transport, tcp_transport))
+        std_transport!(OrTransport::new(relay_transport, tcp_transport))
     } else {
-        std_transport_psk!(tcp_transport)
+        std_transport!(tcp_transport)
     };
     let swarm = libp2p::swarm::SwarmBuilder::new(transport, behavior, local_peer_id)
         .build();
     Ok(swarm)
 }
 
-async fn run(mut swarm: Swarm<StampBehavior>, incoming: Receiver<Command>, outgoing: Sender<Event>) -> Result<(), SError> {
+/// Run our swarm and start talking to StampNet
+#[tracing::instrument(skip(swarm, incoming, outgoing))]
+pub async fn run(mut swarm: Swarm<StampBehavior>, incoming: Receiver<Command>, outgoing: Sender<Event>) -> Result<()> {
     macro_rules! outgoing {
         ($val:expr) => {
             match outgoing.send($val).await {
-                Err(e) => error!("stampnet::run() -- {:?}", e),
+                Err(e) => error!("stamp_net::core::run() -- {:?}", e),
                 _ => {}
             }
         }
@@ -256,22 +255,22 @@ async fn run(mut swarm: Swarm<StampBehavior>, incoming: Receiver<Command>, outgo
                     let topic = IdentTopic::new(name.as_str());
                     let len = message.len();
                     match swarm.behaviour_mut().gossipsub.publish(topic, message) {
-                        Ok(msgid) => info!("gossip: send: {} ({} -- {} bytes)", name, msgid, len),
+                        Ok(msgid) => debug!("gossip: send: {} ({} -- {} bytes)", name, msgid, len),
                         Err(e) => info!("gossip: send: err: {:?}", e),
                     }
                 }
                 Ok(Command::TopicSubscribe { topic: name }) => {
                     let topic = IdentTopic::new(name.as_str());
                     match swarm.behaviour_mut().gossipsub.subscribe(&topic) {
-                        Ok(true) => info!("gossip: subscribe: +{}", name),
+                        Ok(true) => info!("gossip: subscribe: {}", name),
                         Ok(false) => {}
                         Err(e) => warn!("gossip: subscribe: error: {:?}", e),
                     }
 
                     let key = Key::new(&Vec::from(name.as_bytes()));
                     match swarm.behaviour_mut().kad.start_providing(key.clone()) {
-                        Err(_e) => {
-                            outgoing!{ Event::Error(SError::Custom("failed to start providing topic".into())) }
+                        Err(e) => {
+                            outgoing!{ Event::Error(Error::KadRecord(e)) }
                         }
                         _ => {}
                     }
@@ -281,7 +280,7 @@ async fn run(mut swarm: Swarm<StampBehavior>, incoming: Receiver<Command>, outgo
                 Ok(Command::TopicUnsubscribe { topic: name }) => {
                     let topic = IdentTopic::new(name.as_str());
                     match swarm.behaviour_mut().gossipsub.unsubscribe(&topic) {
-                        Ok(true) => info!("gossip: unsubscribe: -{}", name),
+                        Ok(true) => info!("gossip: unsubscribe: {}", name),
                         Ok(false) => {}
                         Err(e) => warn!("gossip: unsubscribe: error: {:?}", e),
                     }
@@ -317,11 +316,14 @@ async fn run(mut swarm: Swarm<StampBehavior>, incoming: Receiver<Command>, outgo
                             if seen.contains(&circuit_addr) {
                                 continue;
                             }
+                            if swarm.listeners().find(|l| *l == &circuit_addr).is_some() {
+                                continue;
+                            }
                             info!("Creating circuit relay listener: {:?}", circuit_addr);
                             match swarm.listen_on(circuit_addr.clone()) {
                                 Ok(_) => {}
-                                Err(_e) => {
-                                    outgoing!{ Event::Error(SError::Custom("failed to create swarm circuit listener".into())) }
+                                Err(e) => {
+                                    outgoing!{ Event::Error(Error::Transport(format!("{}", e))) }
                                 }
                             }
                             seen.insert(circuit_addr);
@@ -329,14 +331,24 @@ async fn run(mut swarm: Swarm<StampBehavior>, incoming: Receiver<Command>, outgo
                     }
                     if !kad_has_bootstrapped {
                         match swarm.behaviour_mut().kad.bootstrap() {
-                            Err(_e) => {
-                                outgoing!{ Event::Error(SError::Custom("failed to boostrap kad".into())) }
+                            Err(_) => {
+                                outgoing!{ Event::Error(Error::KadBootstrap) }
                             }
                             _ => {
                                 kad_has_bootstrapped = true;
                             }
                         }
                     }
+                }
+                SwarmEvent::Behaviour(StampEvent::Gossipsub(GossipsubEvent::Message {message, ..})) => {
+                    let GossipsubMessage { source, data, topic, .. } = message;
+                    outgoing!{ Event::GossipMessage { peer_id: source, data, topic: topic.into_string() } }
+                }
+                SwarmEvent::Behaviour(StampEvent::Gossipsub(GossipsubEvent::Subscribed {topic, ..})) => {
+                    outgoing!{ Event::GossipSubscribed { topic: topic.into_string() } }
+                }
+                SwarmEvent::Behaviour(StampEvent::Gossipsub(GossipsubEvent::Unsubscribed {topic, ..})) => {
+                    outgoing!{ Event::GossipUnsubscribed { topic: topic.into_string() } }
                 }
                 SwarmEvent::Behaviour(StampEvent::Kad(KademliaEvent::OutboundQueryCompleted {id: _id, result: QueryResult::Bootstrap(Ok(res)), stats: _stats})) => {
                     if res.num_remaining == 0 {
@@ -363,18 +375,24 @@ async fn run(mut swarm: Swarm<StampBehavior>, incoming: Receiver<Command>, outgo
                             info!("gossip: dialing {:?}", addr);
                             match swarm.dial(addr.clone()) {
                                 Ok(_) => {}
-                                Err(err) => {
-                                    outgoing!{ Event::Error(SError::Custom(format!("gossip: failed to dial {:?}: {:?}", addr, err))) }
+                                Err(e) => {
+                                    outgoing!{ Event::Error(Error::DialError(e)) }
                                 }
                             }
                         }
                     }
                 }
                 SwarmEvent::Behaviour(StampEvent::Ping(ev)) => {
+                    match ev.result {
+                        Ok(PingSuccess::Ping { .. }) => outgoing!{ Event::Ping },
+                        Ok(PingSuccess::Pong) => outgoing!{ Event::Pong },
+                        _ => {}
+                    }
+                    outgoing!{ Event::Ping }
                     trace!("ping: {:?}", ev);
                 }
                 SwarmEvent::Behaviour(any) => {
-                    info!("oh behave: {:?}", any);
+                    info!("swarm event: {:?}", any);
                 }
                 SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
                     info!("swarm: connection opened: {} -- {:?}", peer_id, endpoint);
@@ -393,116 +411,3 @@ async fn run(mut swarm: Swarm<StampBehavior>, incoming: Receiver<Command>, outgo
     Ok(())
 }
 
-#[async_std::main]
-async fn main() -> Result<(), Box<dyn Error>> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-    let app = App::new("Stampnet")
-        .bin_name("stamp-net")
-        .max_term_width(100)
-        .about("A stamp net test program")
-        .arg(Arg::with_name("listen")
-            .short('l')
-            .long("listen")
-            .takes_value(true)
-            .help("A MultiAddr listen address"))
-        .arg(Arg::with_name("public")
-            .short('p')
-            .long("public")
-            .takes_value(false)
-            .help("Sets this instance to public (acts as a relay)"))
-        .arg(Arg::with_name("bootstrap")
-            .short('b')
-            .long("bootstrap")
-            .takes_value(true)
-            .value_delimiter(',')
-            .help("A node to bootstrap with. Separate multiple nodes with a comma (,)"))
-        .arg(Arg::with_name("message")
-            .short('m')
-            .long("message")
-            .takes_value(true)
-            .help("A message to send on the main topic."))
-        .arg(Arg::with_name("message-delay")
-            .short('d')
-            .long("message-delay")
-            .takes_value(true)
-            .value_parser(clap::value_parser!(u64))
-            .help("A message to send on the main topic."))
-        .arg(Arg::with_name("seed")
-            .short('s')
-            .long("seed")
-            .takes_value(true)
-            .value_parser(clap::value_parser!(u8))
-            .help("A seed value (0-255) to initiate the private key"))
-        .arg(Arg::with_name("psk")
-            .long("psk")
-            .takes_value(true)
-            .value_parser(clap::value_parser!(u8))
-            .help("A seed value (0-255) to initiate psk communication"));
-    let args = app.get_matches();
-    let listen_addr = args.value_of("listen");
-    let public = args.is_present("public");
-    let bootstrap_nodes = args.values_of("bootstrap")
-        .map(|b| b.collect::<Vec<_>>())
-        .unwrap_or_else(|| Vec::new());
-    let message = args.value_of("message").map(|x| String::from(x));
-    let message_delay: u64 = args.get_one("message-delay").map(|x| *x).unwrap_or(15);
-    let seed: Option<&u8> = args.get_one("seed");
-    let psk: Option<&u8> = args.get_one("psk");
-
-    fn generate_key(seed: u8) -> Keypair {
-        let mut bytes = [0u8; 32];
-        bytes[0] = seed;
-
-        let secret_key = identity::ed25519::SecretKey::from_bytes(&mut bytes)
-            .expect("this returns `Err` only if the length is wrong; the length is correct; qed");
-        Keypair::Ed25519(secret_key.into())
-    }
-
-    let local_key = seed
-        .map(|s| generate_key(*s))
-        .unwrap_or_else(|| Keypair::generate_ed25519());
-    let pre_shared_key = psk.map(|seed| PreSharedKey::new([*seed; 32]));
-    let mut swarm = setup(local_key, public, pre_shared_key)?;
-    if let Some(listen_addr) = listen_addr {
-        swarm.listen_on(listen_addr.parse()?)?;
-    }
-    for node in bootstrap_nodes {
-        let address: Multiaddr = node.parse()?;
-        match swarm.dial(address.clone()) {
-            Ok(_) => info!("Dialed {:?}", address),
-            Err(e) => error!("Dial {:?} failed: {:?}", address, e),
-        };
-    }
-
-    let (incoming_send, incoming_recv) = channel::bounded::<Command>(16);
-    let (outgoing_send, outgoing_recv) = channel::bounded::<Event>(16);
-    let runner = task::spawn(async {
-        run(swarm, incoming_recv, outgoing_send).await
-    });
-    let events = task::spawn(async move {
-        loop {
-            let event = outgoing_recv.recv().await
-                .map_err(|e| SError::Custom(format!("failed to recv event: {:?}", e)))?;
-            info!("event: {:?}", event);
-            match event {
-                Event::DiscoveryReady => {
-                    if let Some(msg) = message.as_ref() {
-                        task::sleep(Duration::from_secs(5)).await;
-                        incoming_send.send(Command::TopicSubscribe { topic: "chatter".into() }).await
-                            .map_err(|e| SError::Custom(format!("failed to signal swarm: {:?}", e)))?;
-                        task::sleep(Duration::from_secs(message_delay)).await;
-                        incoming_send.send(Command::TopicSend { topic: "chatter".into(), message: Vec::from(msg.as_bytes()) }).await
-                            .map_err(|e| SError::Custom(format!("failed to signal swarm: {:?}", e)))?;
-                    }
-                }
-                Event::Quit => { break; }
-                _ => {}
-            }
-        }
-        Ok::<(), SError>(())
-    });
-
-    runner.await.map_err(|_| std::io::Error::from_raw_os_error(1))?;
-    events.await.map_err(|_| std::io::Error::from_raw_os_error(1))?;
-    Ok(())
-}
