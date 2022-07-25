@@ -143,9 +143,9 @@ pub enum Event {
     /// Someone wants the (encrypted) transactions in an identity
     RequestIdentity(IdentityRequest),
     /// Let the listener know we've subscribed to our topic
-    Subscribed,
+    Subscribed { topic: String },
     /// Let the listener know we've unsubscribed from our topic
-    Unsubscribed,
+    Unsubscribed { topic: String },
 }
 
 impl fmt::Display for Event {
@@ -160,8 +160,8 @@ impl fmt::Display for Event {
             Self::RequestIdentity(req) => {
                 write!(f, "Event::RequestIdentity({})", req.already_have().len())
             }
-            Self::Subscribed => write!(f, "Event::Subscribed"),
-            Self::Unsubscribed => write!(f, "Event::Unsubscribed"),
+            Self::Subscribed { topic } => write!(f, "Event::Subscribed({})", topic),
+            Self::Unsubscribed { topic } => write!(f, "Event::Unsubscribed({})", topic),
         }
     }
 }
@@ -272,14 +272,14 @@ pub async fn run(channel: &str, sync_pubkey: &SignKeypairPublic, core_incoming: 
                 Ok(crate::core::Event::GossipSubscribed { topic }) => {
                     if topic == topic_name {
                         subscribed = true;
-                        sender!{ sync_outgoing, Event::Subscribed }
+                        sender!{ sync_outgoing, Event::Subscribed { topic } }
                         sender!{ sync_outgoing, Event::MaybeRequestIdentity }
                     }
                 }
                 Ok(crate::core::Event::GossipUnsubscribed { topic }) => {
                     if topic == topic_name {
                         subscribed = false;
-                        sender!{ sync_outgoing, Event::Unsubscribed }
+                        sender!{ sync_outgoing, Event::Unsubscribed { topic } }
                     }
                 }
                 Ok(crate::core::Event::Pong) => {
