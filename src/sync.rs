@@ -18,7 +18,7 @@ use stamp_core::{
 };
 use std::fmt;
 use std::ops::Deref;
-use tracing::{error, info, warn};
+use tracing::{error};
 
 /// An encrypted identity transaction tagged with an unencrypted transaction id.
 /// The id can't be trusted, but because private syncing is meant for trusted
@@ -126,7 +126,7 @@ pub enum Command {
     /// Quit the loop
     Quit,
     /// Send an (encrypted) identity transaction
-    SendTransaction(TransactionMessageSigned),
+    SendTransactions(Vec<TransactionMessageSigned>),
 }
 
 /// Sync events we might want to pay attention to
@@ -135,7 +135,7 @@ pub enum Event {
     /// An error happened
     Error(Error),
     /// We received an (encrypted) identity transaction
-    IdentityTransaction(TransactionMessageSigned),
+    IdentityTransactions(Vec<TransactionMessageSigned>),
     /// Sent out when it might be a good time to ask for transactions
     MaybeRequestIdentity,
     /// Quit signal
@@ -152,8 +152,8 @@ impl fmt::Display for Event {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Error(e) => write!(f, "Event::Error({})", e),
-            Self::IdentityTransaction(trans) => {
-                write!(f, "Event::IdentityTransaction({})", String::from(trans.transaction().id()))
+            Self::IdentityTransactions(transactions) => {
+                write!(f, "Event::IdentityTransactions({} entries)", transactions.len())
             }
             Self::MaybeRequestIdentity => write!(f, "Event::MaybeRequestIdentity"),
             Self::Quit => write!(f, "Event::Quit"),
@@ -175,7 +175,7 @@ impl fmt::Display for Event {
 pub enum Message {
     /// Send an identity transaction out to the gossip group
     #[rasn(tag(explicit(0)))]
-    IdentityTransaction(TransactionMessageSigned),
+    IdentityTransactions(Vec<TransactionMessageSigned>),
     /// Request all identity parts from all nodes in the gossip group
     #[rasn(tag(explicit(1)))]
     RequestIdentity(IdentityRequest),
@@ -217,18 +217,24 @@ pub async fn run(channel: &str, sync_pubkey: &SignKeypairPublic, core_incoming: 
                         Err(e) => error!("Error serializing identity request: {}", e),
                     }
                 }
-                Ok(Command::SendTransaction(trans)) => {
-                    let trans_id = trans.transaction().id().clone();
-                    match (trans.verify(sync_pubkey), util::serialize(&Message::IdentityTransaction(trans))) {
-                        (Ok(_), Ok(ser)) => {
-                            info!("Publishing transaction {}", String::from(trans_id));
-                            sender!{ core_incoming, crate::core::Command::TopicSend {
-                                topic: topic_name.clone(),
-                                message: ser,
-                            } }
+                Ok(Command::SendTransactions(transactions)) => {
+                    let verified = transactions.into_iter()
+                        .map(|trans| trans.verify(sync_pubkey).map(|_| trans))
+                        .collect::<Result<Vec<_>>>();
+
+                    match verified {
+                        Ok(transactions) => {
+                            match util::serialize(&Message::IdentityTransactions(transactions)) {
+                                Ok(ser) => {
+                                    sender!{ core_incoming, crate::core::Command::TopicSend {
+                                        topic: topic_name.clone(),
+                                        message: ser,
+                                    } }
+                                }
+                                Err(e) => error!("Error serializing transaction message: {}", e),
+                            }
                         }
-                        (Err(e), _) => error!("Transaction being sent to peers in invalid: {}", e),
-                        (_, Err(e)) => error!("Error serializing transaction message: {}", e),
+                        Err(e) => error!("Failed to validate outgoing transactions: {}", e),
                     }
                 }
                 Err(e) => {
@@ -245,14 +251,15 @@ pub async fn run(channel: &str, sync_pubkey: &SignKeypairPublic, core_incoming: 
                 Ok(crate::core::Event::GossipMessage { peer_id, topic, data }) => {
                     if topic == topic_name {
                         match util::deserialize::<Message>(&data) {
-                            Ok(Message::IdentityTransaction(signed)) => {
-                                match signed.verify(sync_pubkey) {
-                                    Ok(_) => {
-                                        sender!{ sync_outgoing, Event::IdentityTransaction(signed) }
+                            Ok(Message::IdentityTransactions(transactions)) => {
+                                let verified = transactions.into_iter()
+                                    .map(|trans| trans.verify(sync_pubkey).map(|_| trans))
+                                    .collect::<Result<Vec<_>>>();
+                                match verified {
+                                    Ok(transactions) => {
+                                        sender!{ sync_outgoing, Event::IdentityTransactions(transactions) }
                                     }
-                                    Err(e) => {
-                                        warn!("Failed to verify transaction {} (channel {}) -- skipping: {}", String::from(signed.transaction().id()), topic_name, e);
-                                    }
+                                    Err(e) => error!("Failed to verify transactions (channel {}): {}", topic_name, e),
                                 }
                             }
                             Ok(Message::RequestIdentity(req)) => {
