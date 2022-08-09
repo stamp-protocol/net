@@ -242,7 +242,7 @@ pub async fn run(mut swarm: Swarm<StampBehavior>, incoming: Receiver<Command>, o
     macro_rules! outgoing {
         ($val:expr) => {
             match outgoing.send($val).await {
-                Err(e) => error!("stamp_net::core::run() -- {:?}", e),
+                Err(e) => error!("stamp_net::core::run() -- {}:{} -- {:?}", file!(), line!(), e),
                 _ => {}
             }
         }
