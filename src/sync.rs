@@ -204,7 +204,6 @@ pub async fn run(channel: &str, sync_pubkey: &SignKeypairPublic, core_incoming: 
                 }
                 Ok(Command::Quit) => {
                     sender! { core_incoming, crate::core::Command::Quit }
-                    break;
                 }
                 Ok(Command::RequestIdentity(req)) => {
                     match util::serialize(&Message::RequestIdentity(req)) {
@@ -286,6 +285,10 @@ pub async fn run(channel: &str, sync_pubkey: &SignKeypairPublic, core_incoming: 
                     if subscribed {
                         sender!{ sync_outgoing, Event::MaybeRequestIdentity }
                     }
+                }
+                Ok(crate::core::Event::Quit) => {
+                    sender!{ sync_outgoing, Event::Quit }
+                    break;
                 }
                 Err(e) => {
                     sender!{ sync_outgoing, Event::Error(Error::ChannelSend(format!("{}", e))) }
