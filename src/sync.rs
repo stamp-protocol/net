@@ -12,8 +12,8 @@ use futures::{prelude::*, select};
 use getset;
 use rasn::{Encode, Decode, AsnType};
 use stamp_core::{
-    crypto::key::{SecretKey, SecretKeyNonce, SignKeypair, SignKeypairPublic, SignKeypairSignature},
-    dag::{TransactionID, TransactionVersioned},
+    crypto::base::{SecretKey, SecretKeyNonce, SignKeypair, SignKeypairPublic, SignKeypairSignature},
+    dag::{TransactionID, Transaction},
     util::BinaryVec,
 };
 use std::fmt;
@@ -32,7 +32,7 @@ pub struct TransactionMessage {
     /// Nonce for the encrypted transaction
     #[rasn(tag(explicit(1)))]
     nonce: SecretKeyNonce,
-    /// The encrypted [TransactionVersioned][stamp_core::dag::TransactionVersioned]
+    /// The encrypted [Transaction][stamp_core::dag::Transaction]
     #[rasn(tag(explicit(2)))]
     body: BinaryVec,
 }
@@ -61,7 +61,7 @@ pub struct TransactionMessageSigned {
 
 impl TransactionMessageSigned {
     /// Create and sign a new `TransactionMessageSigned`.
-    pub fn seal_and_sign(enc_key: &SecretKey, sign_keypair: &SignKeypair, transaction: &TransactionVersioned) -> Result<Self> {
+    pub fn seal_and_sign(enc_key: &SecretKey, sign_keypair: &SignKeypair, transaction: &Transaction) -> Result<Self> {
         let transaction_ser = util::serialize(transaction)?;
         let nonce = enc_key.gen_nonce()?;
         let encrypted_trans = enc_key.seal(transaction_ser.as_slice(), &nonce)?;
@@ -83,7 +83,7 @@ impl TransactionMessageSigned {
 
     /// Open this sealed transaction. Please use [verify()][verify] before attempting
     /// to open this.
-    pub fn open(self, enc_key: &SecretKey) -> Result<TransactionVersioned> {
+    pub fn open(self, enc_key: &SecretKey) -> Result<Transaction> {
         let Self { transaction, .. } = self;
         let dec = enc_key.open(transaction.body().deref(), transaction.nonce())?;
         util::deserialize(dec.as_slice())
