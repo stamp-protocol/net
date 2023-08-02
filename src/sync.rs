@@ -1,9 +1,6 @@
 //! The sync module allows syncing your private identity across your devices
 //! securely.
 
-use async_std::{
-    channel::{Receiver, Sender},
-};
 use crate::{
     error::{Error, Result},
     util,
@@ -18,6 +15,7 @@ use stamp_core::{
 };
 use std::fmt;
 use std::ops::Deref;
+use tokio::sync::mpsc::{Receiver, Sender};
 use tracing::{error};
 
 /// An encrypted identity transaction tagged with an unencrypted transaction id.
@@ -184,7 +182,7 @@ pub enum Message {
 /// Wraps the raw core event/command pipeline to add stuff relevant to private
 /// syncing.
 #[tracing::instrument(skip(channel, sync_pubkey, core_incoming, core_outgoing, sync_incoming, sync_outgoing))]
-pub async fn run(channel: &str, sync_pubkey: &SignKeypairPublic, core_incoming: Sender<crate::core::Command>, core_outgoing: Receiver<crate::core::Event>, sync_incoming: Receiver<Command>, sync_outgoing: Sender<Event>) -> Result<()> {
+pub async fn run(channel: &str, sync_pubkey: &SignKeypairPublic, core_incoming: Sender<crate::core::Command>, mut core_outgoing: Receiver<crate::core::Event>, mut sync_incoming: Receiver<Command>, sync_outgoing: Sender<Event>) -> Result<()> {
     let channel = String::from(channel);
     macro_rules! sender {
         ($sender:expr, $val:expr) => {
@@ -199,13 +197,13 @@ pub async fn run(channel: &str, sync_pubkey: &SignKeypairPublic, core_incoming: 
     loop {
         select! {
             cmd = sync_incoming.recv().fuse() => match cmd {
-                Ok(Command::Forward(core_cmd)) => {
+                Some(Command::Forward(core_cmd)) => {
                     sender! { core_incoming, core_cmd }
                 }
-                Ok(Command::Quit) => {
+                Some(Command::Quit) => {
                     sender! { core_incoming, crate::core::Command::Quit }
                 }
-                Ok(Command::RequestIdentity(req)) => {
+                Some(Command::RequestIdentity(req)) => {
                     match util::serialize(&Message::RequestIdentity(req)) {
                         Ok(ser) => {
                             sender!{ core_incoming, crate::core::Command::TopicSend {
@@ -216,7 +214,7 @@ pub async fn run(channel: &str, sync_pubkey: &SignKeypairPublic, core_incoming: 
                         Err(e) => error!("Error serializing identity request: {}", e),
                     }
                 }
-                Ok(Command::SendTransactions(transactions)) => {
+                Some(Command::SendTransactions(transactions)) => {
                     let verified = transactions.into_iter()
                         .map(|trans| trans.verify(sync_pubkey).map(|_| trans))
                         .collect::<Result<Vec<_>>>();
@@ -236,18 +234,16 @@ pub async fn run(channel: &str, sync_pubkey: &SignKeypairPublic, core_incoming: 
                         Err(e) => error!("Failed to validate outgoing transactions: {}", e),
                     }
                 }
-                Err(e) => {
-                    sender!{ sync_outgoing, Event::Error(Error::ChannelRecv(e)) }
-                }
+                _ => {}
             },
             event = core_outgoing.recv().fuse() => match event {
-                Ok(crate::core::Event::DiscoveryReady) => {
+                Some(crate::core::Event::DiscoveryReady) => {
                     sender!{ core_incoming, crate::core::Command::TopicSubscribe { topic: topic_name.clone() } }
                 }
-                Ok(crate::core::Event::Error(e)) => {
+                Some(crate::core::Event::Error(e)) => {
                     sender!{ sync_outgoing, Event::Error(e) }
                 }
-                Ok(crate::core::Event::GossipMessage { peer_id, topic, data }) => {
+                Some(crate::core::Event::GossipMessage { peer_id, topic, data }) => {
                     if topic == topic_name {
                         match util::deserialize::<Message>(&data) {
                             Ok(Message::IdentityTransactions(transactions)) => {
@@ -268,30 +264,27 @@ pub async fn run(channel: &str, sync_pubkey: &SignKeypairPublic, core_incoming: 
                         }
                     }
                 }
-                Ok(crate::core::Event::GossipSubscribed { topic }) => {
+                Some(crate::core::Event::GossipSubscribed { topic }) => {
                     if topic == topic_name {
                         subscribed = true;
                         sender!{ sync_outgoing, Event::Subscribed { topic } }
                         sender!{ sync_outgoing, Event::MaybeRequestIdentity }
                     }
                 }
-                Ok(crate::core::Event::GossipUnsubscribed { topic }) => {
+                Some(crate::core::Event::GossipUnsubscribed { topic }) => {
                     if topic == topic_name {
                         subscribed = false;
                         sender!{ sync_outgoing, Event::Unsubscribed { topic } }
                     }
                 }
-                Ok(crate::core::Event::Pong) => {
+                Some(crate::core::Event::Pong) => {
                     if subscribed {
                         sender!{ sync_outgoing, Event::MaybeRequestIdentity }
                     }
                 }
-                Ok(crate::core::Event::Quit) => {
+                Some(crate::core::Event::Quit) => {
                     sender!{ sync_outgoing, Event::Quit }
                     break;
-                }
-                Err(e) => {
-                    sender!{ sync_outgoing, Event::Error(Error::ChannelSend(format!("{}", e))) }
                 }
                 _ => {}
             },

@@ -1,6 +1,3 @@
-use async_std::{
-    channel::{Receiver, Sender},
-};
 pub use crate::error::{Error, Result};
 use futures::{prelude::*, select};
 use libp2p::{
@@ -41,6 +38,7 @@ use libp2p::{
 };
 use std::collections::HashSet;
 use std::time::Duration;
+use tokio::sync::mpsc::{Receiver, Sender};
 use tracing::{debug, error, info, warn, trace};
 
 #[derive(Debug)]
@@ -238,7 +236,7 @@ pub fn setup(local_key: Keypair, public: bool) -> Result<Swarm<StampBehavior>> {
 
 /// Run our swarm and start talking to StampNet
 #[tracing::instrument(skip(swarm, incoming, outgoing))]
-pub async fn run(mut swarm: Swarm<StampBehavior>, incoming: Receiver<Command>, outgoing: Sender<Event>) -> Result<()> {
+pub async fn run(mut swarm: Swarm<StampBehavior>, mut incoming: Receiver<Command>, outgoing: Sender<Event>) -> Result<()> {
     macro_rules! outgoing {
         ($val:expr) => {
             match outgoing.send($val).await {
@@ -251,7 +249,7 @@ pub async fn run(mut swarm: Swarm<StampBehavior>, incoming: Receiver<Command>, o
     loop {
         select! {
             cmd = incoming.recv().fuse() => match cmd {
-                Ok(Command::TopicSend { topic: name, message }) => {
+                Some(Command::TopicSend { topic: name, message }) => {
                     let topic = IdentTopic::new(name.as_str());
                     let len = message.len();
                     match swarm.behaviour_mut().gossipsub.publish(topic, message) {
@@ -259,7 +257,7 @@ pub async fn run(mut swarm: Swarm<StampBehavior>, incoming: Receiver<Command>, o
                         Err(e) => info!("gossip: send: err: {:?}", e),
                     }
                 }
-                Ok(Command::TopicSubscribe { topic: name }) => {
+                Some(Command::TopicSubscribe { topic: name }) => {
                     let topic = IdentTopic::new(name.as_str());
                     match swarm.behaviour_mut().gossipsub.subscribe(&topic) {
                         Ok(true) => info!("gossip: subscribe: {}", name),
@@ -277,7 +275,7 @@ pub async fn run(mut swarm: Swarm<StampBehavior>, incoming: Receiver<Command>, o
                     // we catch this on response and add providers
                     swarm.behaviour_mut().kad.get_providers(key.clone());
                 }
-                Ok(Command::TopicUnsubscribe { topic: name }) => {
+                Some(Command::TopicUnsubscribe { topic: name }) => {
                     let topic = IdentTopic::new(name.as_str());
                     match swarm.behaviour_mut().gossipsub.unsubscribe(&topic) {
                         Ok(true) => info!("gossip: unsubscribe: {}", name),
@@ -285,7 +283,7 @@ pub async fn run(mut swarm: Swarm<StampBehavior>, incoming: Receiver<Command>, o
                         Err(e) => warn!("gossip: unsubscribe: error: {:?}", e),
                     }
                 }
-                Ok(Command::Quit) => {
+                Some(Command::Quit) => {
                     outgoing! { Event::Quit }
                     break;
                 }

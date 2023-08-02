@@ -5,12 +5,12 @@ authors = ["Andrew Danger Lyon <andrew@killtheradio.net>"]
 edition = "2021"
 
 [dependencies]
-async-std = { version = "1.12", features = ["attributes"] }
 futures = "0.3"
 getset = "0.1"
 libp2p = { git = "https://github.com/libp2p/rust-libp2p", rev = "62622a1bad70381e56237b4da4d9abcf2b1a0e24", features = ["dcutr"] }
 rasn = "0.7"
 stamp-core = { path = "../core" }
 thiserror = "1.0"
+tokio = { version = "1", features = ["sync"] }
 tracing = { version = "0.1", features = ["log"] }
 

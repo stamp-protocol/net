@@ -15,10 +15,6 @@ pub enum Error {
     #[error("ASN.1 serialization error")]
     ASNSerialize,
 
-    /// Channel recv error
-    #[error("channel recv: {0}")]
-    ChannelRecv(#[from] async_std::channel::RecvError),
-
     /// Channel send error
     #[error("channel send: {0}")]
     ChannelSend(String),
