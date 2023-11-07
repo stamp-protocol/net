@@ -1,117 +1,60 @@
-//! The sync module allows syncing your private identity across your devices
-//! securely.
+//! The sync modules allows syncing Stamp transactions between private parties.
+//!
+//! This can be syncing the *private* transactions within your identity between your devices (ie,
+//! data only you should have access to). It can also be something like setting up an identity to
+//! identity channel for data sharing.
+//!
+//! The best practice here is to wrap your transactions in the [`Transaction::ExtV1`] container
+//! (even if syncing an identity). The reason for this is it allows a generic way to encrypt the
+//! payload -- which in the case of a Stamp identity you almost always want and in the case of
+//! other p2p protocols you'd need to wrap it in an `ExtV1` transaction anyway -- and also attach
+//! *public* metadata to the transaction that allows for generic routing (via the `ty` and
+//! `context` fields of the Ext transaction). Payload encryption and metadata routing make it so an
+//! untrusted third party can relay the transactions *without knowing their contents*.
 
 use crate::{
     error::{Error, Result},
     util,
 };
 use futures::{prelude::*, select};
-use getset;
 use rasn::{Encode, Decode, AsnType};
 use stamp_core::{
-    crypto::base::{SecretKey, SecretKeyNonce, SignKeypair, SignKeypairPublic, SignKeypairSignature},
+    crypto::base::{Sealed, SecretKey, SignKeypair, SignKeypairPublic, SignKeypairSignature},
     dag::{TransactionID, Transaction},
     util::BinaryVec,
 };
 use std::fmt;
-use std::ops::Deref;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tracing::{error};
 
-/// An encrypted identity transaction tagged with an unencrypted transaction id.
-/// The id can't be trusted, but because private syncing is meant for trusted
-/// peers we can 
-#[derive(Debug, Clone, AsnType, Encode, Decode, getset::Getters, getset::MutGetters, getset::Setters)]
-#[getset(get = "pub", get_mut = "pub(crate)", set = "pub(crate)")]
-pub struct TransactionMessage {
-    /// The id of this transaction.
+
+/// Describes a simple, recursive querying mechanism for grabbing transactions from peers.
+#[derive(Debug, Clone, AsnType, Encode, Decode)]
+#[rasn(choice)]
+pub enum TransactionQuery {
+    /// All conditions must match (AND)
     #[rasn(tag(explicit(0)))]
-    id: TransactionID,
-    /// Nonce for the encrypted transaction
+    All(Vec<TransactionQuery>),
+    /// Any of the conditions can match (OR)
     #[rasn(tag(explicit(1)))]
-    nonce: SecretKeyNonce,
-    /// The encrypted [Transaction][stamp_core::dag::Transaction]
+    Any(Vec<TransactionQuery>),
+    /// This condition cannot match (NOT).
     #[rasn(tag(explicit(2)))]
-    body: BinaryVec,
-}
-
-impl TransactionMessage {
-    /// Create a new TransactionMessage LOL
-    pub fn new(id: TransactionID, nonce: SecretKeyNonce, body: BinaryVec) -> Self {
-        Self { id, nonce, body }
-    }
-}
-
-/// A signed container for a [TransactionMessage]. This allows verification for
-/// a transaction message (by blind peers) without being able to decrypt and read
-/// the transaction. The idea here is that a blind peer can discard messages that
-/// aren't signed by the key derived from the private sync key.
-#[derive(Debug, Clone, AsnType, Encode, Decode, getset::Getters, getset::MutGetters, getset::Setters)]
-#[getset(get = "pub", get_mut = "pub(crate)", set = "pub(crate)")]
-pub struct TransactionMessageSigned {
-    /// The [TransactionMessage].
-    #[rasn(tag(explicit(0)))]
-    transaction: TransactionMessage,
-    /// The signature of the transaction message.
-    #[rasn(tag(explicit(1)))]
-    signature: SignKeypairSignature,
-}
-
-impl TransactionMessageSigned {
-    /// Create and sign a new `TransactionMessageSigned`.
-    pub fn seal_and_sign(enc_key: &SecretKey, sign_keypair: &SignKeypair, transaction: &Transaction) -> Result<Self> {
-        let transaction_ser = util::serialize(transaction)?;
-        let nonce = enc_key.gen_nonce()?;
-        let encrypted_trans = enc_key.seal(transaction_ser.as_slice(), &nonce)?;
-        let msg = TransactionMessage::new(transaction.id().clone(), nonce, BinaryVec::from(encrypted_trans));
-        let msg_ser = util::serialize(&msg)?;
-        let sig = sign_keypair.sign(enc_key, msg_ser.as_slice())?;
-        Ok(Self {
-            transaction: msg,
-            signature: sig,
-        })
-    }
-
-    /// Verify this transaction with a public key.
-    pub fn verify(&self, pubkey: &SignKeypairPublic) -> Result<()> {
-        let serialized = util::serialize(self.transaction())?;
-        pubkey.verify(self.signature(), serialized.as_slice())?;
-        Ok(())
-    }
-
-    /// Open this sealed transaction. Please use [verify()][verify] before attempting
-    /// to open this.
-    pub fn open(self, enc_key: &SecretKey) -> Result<Transaction> {
-        let Self { transaction, .. } = self;
-        let dec = enc_key.open(transaction.body().deref(), transaction.nonce())?;
-        util::deserialize(dec.as_slice())
-    }
-
-    /// Turn this signed transaction message into a byte vector
-    pub fn serialize(&self) -> Result<Vec<u8>> {
-        util::serialize(self)
-    }
-
-    /// Turn a byte slice into a signed transaction message
-    pub fn deserialize(bytes: &[u8]) -> Result<Self> {
-        util::deserialize(bytes)
-    }
-}
-
-/// A request for identity transactions
-#[derive(Debug, Clone, AsnType, Encode, Decode, getset::Getters, getset::MutGetters, getset::Setters)]
-#[getset(get = "pub", get_mut = "pub(crate)", set = "pub(crate)")]
-pub struct IdentityRequest {
-    /// Transactions we already have and don't care about plz don't send ty
-    #[rasn(tag(explicit(0)))]
-    pub already_have: Vec<TransactionID>,
-}
-
-impl IdentityRequest {
-    /// Create a new identity request
-    pub fn new(already_have: Vec<TransactionID>) -> Self {
-        Self { already_have }
-    }
+    Not(Box<TransactionQuery>),
+    /// Query transactions by their `ExtV1.context` field
+    #[rasn(tag(explicit(3)))]
+    TransactionContext {
+        #[rasn(tag(explicit(0)))]
+        key: BinaryVec,
+        #[rasn(tag(explicit(1)))]
+        val: BinaryVec,
+    },
+    /// Grab a transaction by its ID
+    #[rasn(tag(explicit(4)))]
+    TransactionID(TransactionID),
+    /// Grab a transaction by its `ExtV1.type` field
+    #[rasn(tag(explicit(5)))]
+    TransactionType(BinaryVec),
 }
 
 /// Send a command to the sync runner
@@ -119,12 +62,15 @@ impl IdentityRequest {
 pub enum Command {
     /// Forwards a command to the core
     Forward(crate::core::Command),
-    /// Ask peers for chunks of the identity we may be missing
-    RequestIdentity(IdentityRequest),
+    /// Ask peers for transactions
+    QueryTransactions(TransactionQuery),
     /// Quit the loop
     Quit,
-    /// Send an (encrypted) identity transaction
-    SendTransactions(Vec<TransactionMessageSigned>),
+    /// Send a Stamp transaction. Generally, this should be an ExtV1 transaction with an encrypted
+    /// `payload` that has both the `TransactionID` of the inner transaction and the channel we're
+    /// operating on in the `context` field under `transaction_id` and `channel` fields
+    /// restecpively.
+    SendTransactions(Vec<Transaction>),
 }
 
 /// Sync events we might want to pay attention to
@@ -132,16 +78,21 @@ pub enum Command {
 pub enum Event {
     /// An error happened
     Error(Error),
-    /// We received an (encrypted) identity transaction
-    IdentityTransactions(Vec<TransactionMessageSigned>),
     /// Sent out when it might be a good time to ask for transactions
-    MaybeRequestIdentity,
+    MaybeRequestTransactions,
+    /// An incoming transaction query.
+    QueryTransactions(TransactionQuery),
     /// Quit signal
     Quit,
-    /// Someone wants the (encrypted) transactions in an identity
-    RequestIdentity(IdentityRequest),
     /// Let the listener know we've subscribed to our topic
     Subscribed { topic: String },
+    /// Received some transactinos.
+    ///
+    /// Generally, this should be an ExtV1 transaction with an encrypted
+    /// `payload` that has both the `TransactionID` of the inner transaction and the channel we're
+    /// operating on in the `context` field under `transaction_id` and `channel` fields
+    /// restecpively.
+    Transactions(Vec<Transaction>),
     /// Let the listener know we've unsubscribed from our topic
     Unsubscribed { topic: String },
 }
@@ -150,15 +101,15 @@ impl fmt::Display for Event {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Error(e) => write!(f, "Event::Error({})", e),
-            Self::IdentityTransactions(transactions) => {
-                write!(f, "Event::IdentityTransactions({} entries)", transactions.len())
+            Self::MaybeRequestTransactions => write!(f, "Event::MaybeRequestTransactions"),
+            Self::QueryTransactions(qry) => {
+                write!(f, "Event::QueryTransactions({:?})", qry)
             }
-            Self::MaybeRequestIdentity => write!(f, "Event::MaybeRequestIdentity"),
             Self::Quit => write!(f, "Event::Quit"),
-            Self::RequestIdentity(req) => {
-                write!(f, "Event::RequestIdentity({})", req.already_have().len())
-            }
             Self::Subscribed { topic } => write!(f, "Event::Subscribed({})", topic),
+            Self::Transactions(transactions) => {
+                write!(f, "Event::Transactions({} entries)", transactions.len())
+            }
             Self::Unsubscribed { topic } => write!(f, "Event::Unsubscribed({})", topic),
         }
     }
@@ -171,12 +122,12 @@ impl fmt::Display for Event {
 #[derive(Debug, Clone, AsnType, Encode, Decode)]
 #[rasn(choice)]
 pub enum Message {
-    /// Send an identity transaction out to the gossip group
+    /// Query a transaction set from our peers.
     #[rasn(tag(explicit(0)))]
-    IdentityTransactions(Vec<TransactionMessageSigned>),
-    /// Request all identity parts from all nodes in the gossip group
+    QueryTransactions(TransactionQuery),
+    /// Send transactions out to the gossip group.
     #[rasn(tag(explicit(1)))]
-    RequestIdentity(IdentityRequest),
+    SendTransactions(Vec<Transaction>),
 }
 
 /// Wraps the raw core event/command pipeline to add stuff relevant to private
@@ -203,8 +154,8 @@ pub async fn run(channel: &str, sync_pubkey: &SignKeypairPublic, core_incoming: 
                 Some(Command::Quit) => {
                     sender! { core_incoming, crate::core::Command::Quit }
                 }
-                Some(Command::RequestIdentity(req)) => {
-                    match util::serialize(&Message::RequestIdentity(req)) {
+                Some(Command::QueryTransactions(qry)) => {
+                    match util::serialize(&Message::QueryTransactions(qry)) {
                         Ok(ser) => {
                             sender!{ core_incoming, crate::core::Command::TopicSend {
                                 topic: topic_name.clone(),
@@ -216,12 +167,12 @@ pub async fn run(channel: &str, sync_pubkey: &SignKeypairPublic, core_incoming: 
                 }
                 Some(Command::SendTransactions(transactions)) => {
                     let verified = transactions.into_iter()
-                        .map(|trans| trans.verify(sync_pubkey).map(|_| trans))
-                        .collect::<Result<Vec<_>>>();
+                        .map(|trans| trans.verify_hash_and_signatures().map(|_| trans))
+                        .collect::<stamp_core::error::Result<Vec<_>>>();
 
                     match verified {
                         Ok(transactions) => {
-                            match util::serialize(&Message::IdentityTransactions(transactions)) {
+                            match util::serialize(&Message::SendTransactions(transactions)) {
                                 Ok(ser) => {
                                     sender!{ core_incoming, crate::core::Command::TopicSend {
                                         topic: topic_name.clone(),
@@ -246,19 +197,19 @@ pub async fn run(channel: &str, sync_pubkey: &SignKeypairPublic, core_incoming: 
                 Some(crate::core::Event::GossipMessage { peer_id, topic, data }) => {
                     if topic == topic_name {
                         match util::deserialize::<Message>(&data) {
-                            Ok(Message::IdentityTransactions(transactions)) => {
+                            Ok(Message::SendTransactions(transactions)) => {
                                 let verified = transactions.into_iter()
-                                    .map(|trans| trans.verify(sync_pubkey).map(|_| trans))
-                                    .collect::<Result<Vec<_>>>();
+                                    .map(|trans| trans.verify_hash_and_signatures().map(|_| trans))
+                                    .collect::<stamp_core::error::Result<Vec<_>>>();
                                 match verified {
                                     Ok(transactions) => {
-                                        sender!{ sync_outgoing, Event::IdentityTransactions(transactions) }
+                                        sender!{ sync_outgoing, Event::Transactions(transactions) }
                                     }
                                     Err(e) => error!("Failed to verify transactions (channel {}): {}", topic_name, e),
                                 }
                             }
-                            Ok(Message::RequestIdentity(req)) => {
-                                sender!{ sync_outgoing, Event::RequestIdentity(req) }
+                            Ok(Message::QueryTransactions(qry)) => {
+                                sender!{ sync_outgoing, Event::QueryTransactions(qry) }
                             }
                             Err(e) => error!("Error deserializing message: {} (from {:?})", e, peer_id),
                         }
@@ -268,7 +219,7 @@ pub async fn run(channel: &str, sync_pubkey: &SignKeypairPublic, core_incoming: 
                     if topic == topic_name {
                         subscribed = true;
                         sender!{ sync_outgoing, Event::Subscribed { topic } }
-                        sender!{ sync_outgoing, Event::MaybeRequestIdentity }
+                        sender!{ sync_outgoing, Event::MaybeRequestTransactions }
                     }
                 }
                 Some(crate::core::Event::GossipUnsubscribed { topic }) => {
@@ -279,7 +230,7 @@ pub async fn run(channel: &str, sync_pubkey: &SignKeypairPublic, core_incoming: 
                 }
                 Some(crate::core::Event::Pong) => {
                     if subscribed {
-                        sender!{ sync_outgoing, Event::MaybeRequestIdentity }
+                        sender!{ sync_outgoing, Event::MaybeRequestTransactions }
                     }
                 }
                 Some(crate::core::Event::Quit) => {
