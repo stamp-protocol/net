@@ -8,7 +8,7 @@ edition = "2021"
 futures = "0.3"
 getset = "0.1"
 libp2p = { git = "https://github.com/libp2p/rust-libp2p", rev = "62622a1bad70381e56237b4da4d9abcf2b1a0e24", features = ["dcutr"] }
-rasn = "0.7"
+rasn = "0.11"
 stamp-core = { path = "../core" }
 thiserror = "1.0"
 tokio = { version = "1", features = ["sync"] }
