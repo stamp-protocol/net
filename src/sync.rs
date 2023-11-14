@@ -1,16 +1,26 @@
-//! The sync modules allows syncing Stamp transactions between private parties.
+//! The sync module allows syncing private Stamp transactions between your devices or devices you
+//! directly share with.
 //!
-//! This can be syncing the *private* transactions within your identity between your devices (ie,
-//! data only you should have access to). It can also be something like setting up an identity to
-//! identity channel for data sharing.
+//! The goal is to be able to share private information (not just Stamp identities, but anything
+//! that can be shoved into a [`TransactionBody::ExtV1`][stamp_core::dag::TransactionBody]
+//! transaction) such that untrusted intermediaries can forward information to the correct nodes
+//! *without being able to read it*.
 //!
-//! The best practice here is to wrap your transactions in the [`Transaction::ExtV1`] container
+//! The best practice here is to wrap your transactions in the `Transaction::ExtV1` container
 //! (even if syncing an identity). The reason for this is it allows a generic way to encrypt the
 //! payload -- which in the case of a Stamp identity you almost always want and in the case of
 //! other p2p protocols you'd need to wrap it in an `ExtV1` transaction anyway -- and also attach
 //! *public* metadata to the transaction that allows for generic routing (via the `ty` and
 //! `context` fields of the Ext transaction). Payload encryption and metadata routing make it so an
 //! untrusted third party can relay the transactions *without knowing their contents*.
+//!
+//! This uses a two-tiered sharing token: trusted nodes get the full token (which contains a key
+//! allowing decryption) and untrusted nodes just get the ability to verify transactions and read
+//! their metadata with no ability to decrypt.
+//!
+//! This is useful for syncing your private Stamp transactions between your devices, but also
+//! allows more intimate interactions/direct sharing between participants *without* requiring an
+//! always-on *trusted* node (aka, an attack surface).
 
 use crate::{
     error::{Error, Result},
