@@ -29,8 +29,9 @@ use crate::{
 use futures::{prelude::*, select};
 use rasn::{Encode, Decode, AsnType};
 use stamp_core::{
-    crypto::base::{Sealed, SecretKey, SignKeypair, SignKeypairPublic, SignKeypairSignature},
+    crypto::base::SignKeypairPublic,
     dag::{TransactionID, Transaction},
+    identity::keychain::AdminKeypairPublic,
     util::BinaryVec,
 };
 use std::fmt;
@@ -144,6 +145,9 @@ pub enum Message {
 /// syncing.
 #[tracing::instrument(skip(channel, sync_pubkey, core_incoming, core_outgoing, sync_incoming, sync_outgoing))]
 pub async fn run(channel: &str, sync_pubkey: &SignKeypairPublic, core_incoming: Sender<crate::core::Command>, mut core_outgoing: Receiver<crate::core::Event>, mut sync_incoming: Receiver<Command>, sync_outgoing: Sender<Event>) -> Result<()> {
+    // convert the signing pubkey into an admin key, which is the only type of key allowed to sign
+    // transactions.
+    let sync_pubkey_as_admin = AdminKeypairPublic::from(sync_pubkey.clone());
     let channel = String::from(channel);
     macro_rules! sender {
         ($sender:expr, $val:expr) => {
@@ -177,6 +181,7 @@ pub async fn run(channel: &str, sync_pubkey: &SignKeypairPublic, core_incoming: 
                 }
                 Some(Command::SendTransactions(transactions)) => {
                     let verified = transactions.into_iter()
+                        .filter(|trans| trans.is_signed_by(&sync_pubkey_as_admin))
                         .map(|trans| trans.verify_hash_and_signatures().map(|_| trans))
                         .collect::<stamp_core::error::Result<Vec<_>>>();
 
@@ -209,6 +214,7 @@ pub async fn run(channel: &str, sync_pubkey: &SignKeypairPublic, core_incoming: 
                         match util::deserialize::<Message>(&data) {
                             Ok(Message::SendTransactions(transactions)) => {
                                 let verified = transactions.into_iter()
+                                    .filter(|trans| trans.is_signed_by(&sync_pubkey_as_admin))
                                     .map(|trans| trans.verify_hash_and_signatures().map(|_| trans))
                                     .collect::<stamp_core::error::Result<Vec<_>>>();
                                 match verified {
