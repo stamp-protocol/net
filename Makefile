@@ -6,7 +6,7 @@ VARS ?= vars.mk
 
 CARGO ?= $(shell which cargo)
 FEATURES ?= 
-override CARGO_BUILD_ARGS += --features "$(FEATURES)"
+override CARGO_BUILD_ARGS += --features "$(FEATURES)" --color=always
 
 all: build
 

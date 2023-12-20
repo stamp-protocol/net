@@ -7,8 +7,10 @@ edition = "2021"
 [dependencies]
 futures = "0.3"
 getset = "0.1"
-libp2p = { git = "https://github.com/libp2p/rust-libp2p", rev = "62622a1bad70381e56237b4da4d9abcf2b1a0e24", features = ["dcutr"] }
+libp2p = { version = "0.53", features = ["dcutr", "dns", "identify", "kad", "macros", "noise", "ping", "relay", "request-response", "tcp", "tokio", "yamux"] }
 rasn = "0.11"
+serde = "1.0"
+serde_derive = "1.0"
 stamp-core = { path = "../core" }
 thiserror = "1.0"
 tokio = { version = "1", features = ["sync"] }

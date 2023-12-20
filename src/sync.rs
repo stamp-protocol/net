@@ -29,10 +29,15 @@ use crate::{
 use futures::{prelude::*, select};
 use rasn::{Encode, Decode, AsnType};
 use stamp_core::{
+<<<<<<< HEAD
     crypto::base::SignKeypairPublic,
     dag::{TransactionID, Transaction},
     identity::keychain::AdminKeypairPublic,
     util::BinaryVec,
+=======
+    crypto::base::{Sealed, SecretKey, SignKeypair, SignKeypairPublic, SignKeypairSignature},
+    dag::{TransactionID, Transaction},
+>>>>>>> relay
 };
 use std::fmt;
 use tokio::sync::mpsc::{Receiver, Sender};
@@ -244,7 +249,7 @@ pub async fn run(channel: &str, sync_pubkey: &SignKeypairPublic, core_incoming: 
                         sender!{ sync_outgoing, Event::Unsubscribed { topic } }
                     }
                 }
-                Some(crate::core::Event::Pong) => {
+                Some(crate::core::Event::Ping) => {
                     if subscribed {
                         sender!{ sync_outgoing, Event::MaybeRequestTransactions }
                     }

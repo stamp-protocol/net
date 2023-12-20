@@ -15,6 +15,11 @@ pub enum Error {
     #[error("ASN.1 serialization error")]
     ASNSerialize,
 
+    /// An error creating a swarm behavior
+    #[error("libp2p behavior error: {0}")]
+    // NOTE: cannot figure out how to #[from] this, so just going to stringify it for now...
+    BehaviorError(String),
+
     /// Channel send error
     #[error("channel send: {0}")]
     ChannelSend(String),
@@ -33,11 +38,15 @@ pub enum Error {
 
     /// Kad record error
     #[error("kademlia record error: {0}")]
-    KadRecord(#[from] libp2p::kad::record::store::Error),
+    KadRecord(#[from] libp2p::kad::store::Error),
+
+    /// An IO error
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
 
     /// Noise error
     #[error("noise error: {0}")]
-    NoiseError(#[from] libp2p::noise::NoiseError),
+    NoiseError(#[from] libp2p::noise::Error),
 
     /// An error occured in the Stamp protocol itself
     #[error("stamp error: {0}")]

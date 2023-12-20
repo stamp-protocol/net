@@ -5,7 +5,6 @@ use futures::{prelude::*, select};
 use libp2p::{
     Multiaddr, PeerId, Swarm,
     dcutr,
-    gossipsub,
     identify,
     identity::{self, Keypair},
     kad,
@@ -13,6 +12,7 @@ use libp2p::{
     noise,
     ping,
     relay,
+    request_response,
     swarm::{
         NetworkBehaviour, SwarmEvent,
         behaviour::toggle::Toggle,
@@ -114,100 +114,102 @@ pub fn random_peer_key() -> Keypair {
     Keypair::generate_ed25519()
 }
 
-/// Create our listener/processer for the StampNet node.
-#[tracing::instrument(skip(local_key), fields(%public))]
-pub fn setup(local_key: identity::Keypair, public: bool) -> NResult<Swarm<StampBehavior>> {
-    let local_pubkey = local_key.public();
-    let local_peer_id = PeerId::from(local_key.public());
-    info!("Local peer id: {:?}", local_peer_id);
+pub struct Agent {
+    local_key: identity::Keypair,
+    relay_mode: bool,
+    swarm: Swarm<StampBehavior>,
+}
 
-    let dcutr = {
-        Toggle::from(if public { None } else { Some(dcutr::Behaviour::new(local_peer_id.clone())) })
-    };
+impl Agent {
+    /// Create a new agent.
+    pub fn new(local_key: identity::Keypair, relay_mode: bool) -> NResult<Self> {
+        let local_pubkey = local_key.public();
+        let local_peer_id = PeerId::from(local_key.public());
+        info!("Local peer id: {:?}", local_peer_id);
 
-    // Create a Swarm to manage peers and events
-    let gossipsub = {
-        // Set a custom gossipsub
-        let mut builder = gossipsub::ConfigBuilder::default();
-        builder.validation_mode(gossipsub::ValidationMode::Strict);
-        if public {
-            builder.do_px();
-        }
-        let config = builder.build()
-            .map_err(|x| Error::Gossip(format!("{}", x)))?;
-        gossipsub::Behaviour::new(gossipsub::MessageAuthenticity::Signed(local_key.clone()), config)
-            .map_err(|x| Error::Gossip(String::from(x)))?
-    };
+        let dcutr = {
+            Toggle::from(if relay_mode { None } else { Some(dcutr::Behaviour::new(local_peer_id.clone())) })
+        };
 
-    let identify = {
-        let config = identify::Config::new("stampnet/1.0.0".into(), local_pubkey)
-            .with_push_listen_addr_updates(false);
-        identify::Behaviour::new(config)
-    };
+        let reqres = {
 
-    let kad = {
-        let store_config = kad::store::MemoryStoreConfig::default();
-        let store = kad::store::MemoryStore::with_config(local_peer_id.clone(), store_config);
-        let mut config = kad::Config::default();
-        config.set_protocol_names(vec![libp2p::StreamProtocol::new("/stampnet/syncpub/1.0.0")]);
-        config.set_record_filtering(kad::StoreInserts::Unfiltered);    // FilterBoth to enable filtering
-        kad::Behaviour::with_config(local_peer_id.clone(), store, config)
-    };
+        };
 
-    let ping = {
-        let config = ping::Config::new();
-        ping::Behaviour::new(config)
-    };
+        let identify = {
+            let config = identify::Config::new("stampnet/1.0.0".into(), local_pubkey)
+                .with_push_listen_addr_updates(false);
+            identify::Behaviour::new(config)
+        };
 
-    let relay = {
-        if public {
-            info!("setup() -- creating relay behavior");
-            let config = relay::Config::default();
-            Toggle::from(Some(relay::Behaviour::new(local_peer_id.clone(), config)))
-        } else {
-            Toggle::from(None)
-        }
-    };
+        let kad = {
+            let store_config = kad::store::MemoryStoreConfig::default();
+            let store = kad::store::MemoryStore::with_config(local_peer_id.clone(), store_config);
+            let mut config = kad::Config::default();
+            config.set_protocol_names(vec![libp2p::StreamProtocol::new("/stampnet/syncpub/1.0.0")]);
+            config.set_record_filtering(kad::StoreInserts::Unfiltered);    // FilterBoth to enable filtering
+            kad::Behaviour::with_config(local_peer_id.clone(), store, config)
+        };
 
-    let mut behavior = StampBehavior {
-        dcutr,
-        gossipsub,
-        identify,
-        kad,
-        ping,
-        relay,
-        relay_client: Toggle::from(None),
-    };
+        let ping = {
+            let config = ping::Config::new();
+            ping::Behaviour::new(config)
+        };
 
-    let builder = libp2p::SwarmBuilder::with_existing_identity(local_key)
-        .with_tokio()
-        .with_tcp(
-            tcp::Config::default(),
-            noise::Config::new,
-            yamux::Config::default,
-        )?
-        .with_dns()?;
-    let swarm = if public {
-        builder
-            .with_behaviour(|_key| Ok(behavior))
-            .map_err(|e| Error::BehaviorError(format!("{:?}", e)))?
-            .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
-            .build()
-    } else {
-        builder
-            .with_relay_client(
+        let relay = {
+            if public {
+                info!("setup() -- creating relay behavior");
+                let config = relay::Config::default();
+                Toggle::from(Some(relay::Behaviour::new(local_peer_id.clone(), config)))
+            } else {
+                Toggle::from(None)
+            }
+        };
+
+        let mut behavior = StampBehavior {
+            dcutr,
+            gossipsub,
+            identify,
+            kad,
+            ping,
+            relay,
+            relay_client: Toggle::from(None),
+        };
+
+        let builder = libp2p::SwarmBuilder::with_existing_identity(local_key)
+            .with_tokio()
+            .with_tcp(
+                tcp::Config::default(),
                 noise::Config::new,
                 yamux::Config::default,
             )?
-            .with_behaviour(|_key, relay_client| {
-                behavior.relay_client = Toggle::from(Some(relay_client));
-                Ok(behavior)
-            })
-            .map_err(|e| Error::BehaviorError(format!("{:?}", e)))?
-            .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
-            .build()
-    };
-    Ok(swarm)
+            .with_dns()?;
+        let swarm = if public {
+            builder
+                .with_behaviour(|_key| Ok(behavior))
+                .map_err(|e| Error::BehaviorError(format!("{:?}", e)))?
+                .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
+                .build()
+        } else {
+            builder
+                .with_relay_client(
+                    noise::Config::new,
+                    yamux::Config::default,
+                )?
+                .with_behaviour(|_key, relay_client| {
+                    behavior.relay_client = Toggle::from(Some(relay_client));
+                    Ok(behavior)
+                })
+                .map_err(|e| Error::BehaviorError(format!("{:?}", e)))?
+                .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
+                .build()
+        };
+        Ok(swarm)
+    }
+}
+
+/// Create our listener/processer for the StampNet node.
+#[tracing::instrument(skip(local_key), fields(%public))]
+pub fn setup(local_key: identity::Keypair, public: bool) -> NResult<Swarm<StampBehavior>> {
 }
 
 /// Run our swarm and start talking to StampNet
@@ -379,4 +381,5 @@ pub async fn run(mut swarm: Swarm<StampBehavior>, mut incoming: Receiver<Command
     }
     Ok(())
 }
+
 
