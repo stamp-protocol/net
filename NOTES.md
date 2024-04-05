@@ -8,9 +8,10 @@ Need to collect my thoughts.
 - Stamp net handles:
   - Discovery
   - Efficient syncing (N or M peers etc)
-  - Local event-driven API (ie, "query topic", "provide topic", "send topic message", "store at key")
-    - provide topic
-    - query topic
+  - Local API
+    - join topic
+    - leave topic
+    - query transactions
     - send message to topic
     - get identity by id
     - store identity by id

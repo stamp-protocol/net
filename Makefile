@@ -1,43 +1,49 @@
-.PHONY: all clean release build run test test-panic test-st doc macros
+.PHONY: all clean lint fmt release doc build run test test-panic test-st macros
 
 # non-versioned include
 VARS ?= vars.mk
 -include $(VARS)
 
-CARGO ?= $(shell which cargo)
-FEATURES ?= 
 override CARGO_BUILD_ARGS += --features "$(FEATURES)" --color=always
 
 all: build
 
-build: 
-	$(CARGO) build $(CARGO_BUILD_ARGS)
+build: fmt
+	cargo build $(CARGO_BUILD_ARGS)
+
+fmt:
+	cargo fmt
 
 release: override CARGO_BUILD_ARGS += --release
 release: build
 
-run:
-	$(CARGO) run $(CARGO_BUILD_ARGS)
+doc:
+	cargo doc $(CARGO_BUILD_ARGS)
 
-test:
-	$(CARGO) test $(TEST) $(CARGO_BUILD_ARGS) -- --nocapture
+test: fmt
+	cargo test $(TEST) $(CARGO_BUILD_ARGS) -- --nocapture
+
+test-release: override CARGO_BUILD_ARGS += --release
+test-release: test
 
 test-panic: override FEATURES += panic-on-error
-test-panic:
+test-panic: fmt
 	RUST_BACKTRACE=1 \
-		$(CARGO) test \
+		cargo test \
 			$(TEST) \
 			$(CARGO_BUILD_ARGS) -- \
 			--nocapture
 
-test-st:
-	$(CARGO) test $(TEST) $(CARGO_BUILD_ARGS) -- --nocapture --test-threads 1
+test-st: fmt
+	cargo test $(TEST) $(CARGO_BUILD_ARGS) -- --nocapture --test-threads 1
 
-doc:
-	$(CARGO) doc -p turtl_core --no-deps
-
-macros:
-	$(CARGO) rustc -- -Z unstable-options --pretty=expanded
+lint:
+	cargo clippy $(CARGO_BUILD_ARGS) -- \
+		-A clippy::comparison_chain \
+		-A clippy::module_inception \
+		-A clippy::redundant_closure \
+		-A clippy::redundant_pattern_matching \
+		-A clippy::search_is_some
 
 clean:
 	rm -rf target/

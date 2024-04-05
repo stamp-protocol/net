@@ -29,49 +29,15 @@ use crate::{
 use futures::{prelude::*, select};
 use rasn::{Encode, Decode, AsnType};
 use stamp_core::{
-<<<<<<< HEAD
     crypto::base::SignKeypairPublic,
     dag::{TransactionID, Transaction},
     identity::keychain::AdminKeypairPublic,
     util::BinaryVec,
-=======
-    crypto::base::{Sealed, SecretKey, SignKeypair, SignKeypairPublic, SignKeypairSignature},
-    dag::{TransactionID, Transaction},
->>>>>>> relay
 };
 use std::fmt;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tracing::{error};
 
-
-/// Describes a simple, recursive querying mechanism for grabbing transactions from peers.
-#[derive(Debug, Clone, AsnType, Encode, Decode)]
-#[rasn(choice)]
-pub enum TransactionQuery {
-    /// All conditions must match (AND)
-    #[rasn(tag(explicit(0)))]
-    All(Vec<TransactionQuery>),
-    /// Any of the conditions can match (OR)
-    #[rasn(tag(explicit(1)))]
-    Any(Vec<TransactionQuery>),
-    /// This condition cannot match (NOT).
-    #[rasn(tag(explicit(2)))]
-    Not(Box<TransactionQuery>),
-    /// Query transactions by their `ExtV1.context` field
-    #[rasn(tag(explicit(3)))]
-    TransactionContext {
-        #[rasn(tag(explicit(0)))]
-        key: BinaryVec,
-        #[rasn(tag(explicit(1)))]
-        val: BinaryVec,
-    },
-    /// Grab a transaction by its ID
-    #[rasn(tag(explicit(4)))]
-    TransactionID(TransactionID),
-    /// Grab a transaction by its `ExtV1.type` field
-    #[rasn(tag(explicit(5)))]
-    TransactionType(BinaryVec),
-}
 
 /// Send a command to the sync runner
 #[derive(Debug)]

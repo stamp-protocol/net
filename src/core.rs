@@ -5,28 +5,44 @@ use futures::{prelude::*, select};
 use libp2p::{
     Multiaddr, PeerId, Swarm,
     dcutr,
-    gossipsub,
     identify,
     identity::{self, Keypair},
     kad,
     multiaddr,
-    noise,
     ping,
     relay,
+    request_response,
     swarm::{
         NetworkBehaviour, SwarmEvent,
         behaviour::toggle::Toggle,
     },
     tcp,
+    tls,
     yamux,
 };
-use std::collections::HashSet;
+use stamp_core::{
+    dag::{Transaction, TransactionBody},
+    identity::IdentityID,
+    util::SerdeBinary,
+};
+use std::collections::{HashMap, HashSet};
+use std::ops::Deref;
 use std::time::Duration;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tracing::{debug, error, info, warn, trace};
 
+/// The max size a published identity can be. above this, we don't store it remotely. You have to
+/// store it yourself.
+const MAX_PUBLISHED_IDENTITY_SIZE: usize = 1024 * 1024 * 2;
+
 #[derive(Debug)]
 pub enum Command {
+    DhtGetIdentity { identity_id: IdentityID },
+    DhtPutIdentity { identity_id: IdentityID, published: Transaction },
+    DhtGetByEmail { email: String },
+    DhtPutByEmail { email: String, identity_id: IdentityID },
+    DhtGetByName { name: String },
+    DhtPutByName { name: String, identity_id: IdentityID },
     TopicSend { topic: String, message: Vec<u8> },
     TopicSubscribe { topic: String },
     TopicUnsubscribe { topic: String },
@@ -40,6 +56,9 @@ pub enum Event {
     GossipMessage { peer_id: Option<PeerId>, topic: String, data: Vec<u8> },
     GossipSubscribed { topic: String },
     GossipUnsubscribed { topic: String },
+    IdentityFound { identity_id: IdentityID, published: Transaction },
+    IdentityNotFound(IdentityID),
+    IdentityStored(IdentityID),
     Ping,
     Quit,
 }
@@ -48,34 +67,28 @@ pub enum Event {
 #[behaviour(to_swarm = "StampEvent")]
 pub struct StampBehavior {
     dcutr: Toggle<dcutr::Behaviour>,
-    gossipsub: gossipsub::Behaviour,
     identify: identify::Behaviour,
     kad: kad::Behaviour<kad::store::MemoryStore>,
     ping: ping::Behaviour,
     relay_client: Toggle<relay::client::Behaviour>,
     relay: Toggle<relay::Behaviour>,
+    request_response: request_response::Behaviour,
 }
 
 #[derive(Debug)]
 pub enum StampEvent {
     Dcutr(dcutr::Event),
-    Gossipsub(gossipsub::Event),
     Identify(identify::Event),
     Kad(kad::Event),
     Ping(ping::Event),
     Relay(relay::Event),
     RelayClient(relay::client::Event),
+    RequestResponse(request_response::Event),
 }
 
 impl From<dcutr::Event> for StampEvent {
     fn from(event: dcutr::Event) -> Self {
         Self::Dcutr(event)
-    }
-}
-
-impl From<gossipsub::Event> for StampEvent {
-    fn from(event: gossipsub::Event) -> Self {
-        Self::Gossipsub(event)
     }
 }
 
@@ -109,28 +122,33 @@ impl From<relay::client::Event> for StampEvent {
     }
 }
 
+impl From<request_response::Event> for StampEvent {
+    fn from(event: request_response::Event) -> Self {
+        Self::RequestResponse(event)
+    }
+}
+
 /// Generate a new random peer key.
 pub fn random_peer_key() -> Keypair {
     Keypair::generate_ed25519()
 }
 
 /// Create our listener/processer for the StampNet node.
-#[tracing::instrument(skip(local_key), fields(%public))]
-pub fn setup(local_key: identity::Keypair, public: bool) -> NResult<Swarm<StampBehavior>> {
+#[tracing::instrument(skip(local_key), fields(%router_node))]
+pub fn setup(local_key: identity::Keypair, router_node: bool) -> NResult<Swarm<StampBehavior>> {
     let local_pubkey = local_key.public();
     let local_peer_id = PeerId::from(local_key.public());
     info!("Local peer id: {:?}", local_peer_id);
 
     let dcutr = {
-        Toggle::from(if public { None } else { Some(dcutr::Behaviour::new(local_peer_id.clone())) })
+        Toggle::from(if router_node { None } else { Some(dcutr::Behaviour::new(local_peer_id.clone())) })
     };
 
-    // Create a Swarm to manage peers and events
+    /*
     let gossipsub = {
-        // Set a custom gossipsub
         let mut builder = gossipsub::ConfigBuilder::default();
         builder.validation_mode(gossipsub::ValidationMode::Strict);
-        if public {
+        if router_node {
             builder.do_px();
         }
         let config = builder.build()
@@ -138,6 +156,7 @@ pub fn setup(local_key: identity::Keypair, public: bool) -> NResult<Swarm<StampB
         gossipsub::Behaviour::new(gossipsub::MessageAuthenticity::Signed(local_key.clone()), config)
             .map_err(|x| Error::Gossip(String::from(x)))?
     };
+    */
 
     let identify = {
         let config = identify::Config::new("stampnet/1.0.0".into(), local_pubkey)
@@ -149,8 +168,8 @@ pub fn setup(local_key: identity::Keypair, public: bool) -> NResult<Swarm<StampB
         let store_config = kad::store::MemoryStoreConfig::default();
         let store = kad::store::MemoryStore::with_config(local_peer_id.clone(), store_config);
         let mut config = kad::Config::default();
-        config.set_protocol_names(vec![libp2p::StreamProtocol::new("/stampnet/syncpub/1.0.0")]);
-        config.set_record_filtering(kad::StoreInserts::Unfiltered);    // FilterBoth to enable filtering
+        config.set_protocol_names(vec![libp2p::StreamProtocol::new("/stampnet/dht/1.0.0")]);
+        config.set_record_filtering(kad::StoreInserts::FilterBoth);
         kad::Behaviour::with_config(local_peer_id.clone(), store, config)
     };
 
@@ -160,7 +179,7 @@ pub fn setup(local_key: identity::Keypair, public: bool) -> NResult<Swarm<StampB
     };
 
     let relay = {
-        if public {
+        if router_node {
             info!("setup() -- creating relay behavior");
             let config = relay::Config::default();
             Toggle::from(Some(relay::Behaviour::new(local_peer_id.clone(), config)))
@@ -183,11 +202,11 @@ pub fn setup(local_key: identity::Keypair, public: bool) -> NResult<Swarm<StampB
         .with_tokio()
         .with_tcp(
             tcp::Config::default(),
-            noise::Config::new,
+            tls::Config::new,
             yamux::Config::default,
         )?
         .with_dns()?;
-    let swarm = if public {
+    let swarm = if router_node {
         builder
             .with_behaviour(|_key| Ok(behavior))
             .map_err(|e| Error::BehaviorError(format!("{:?}", e)))?
@@ -196,7 +215,7 @@ pub fn setup(local_key: identity::Keypair, public: bool) -> NResult<Swarm<StampB
     } else {
         builder
             .with_relay_client(
-                noise::Config::new,
+                tls::Config::new,
                 yamux::Config::default,
             )?
             .with_behaviour(|_key, relay_client| {
@@ -222,9 +241,95 @@ pub async fn run(mut swarm: Swarm<StampBehavior>, mut incoming: Receiver<Command
         }
     }
     let mut kad_has_bootstrapped = false;
+    let mut kad_response_idx: HashMap<kad::QueryId, Command> = HashMap::new();
     loop {
         select! {
             cmd = incoming.recv().fuse() => match cmd {
+                Some(Command::DhtGetIdentity { identity_id }) => {
+                    let key = kad::RecordKey::new(&format!("/identity/id/{}", identity_id));
+                    let qid = swarm.behaviour_mut().kad.get_record(key);
+                    kad_response_idx.insert(qid, Command::DhtGetIdentity { identity_id }); 
+                }
+                Some(Command::DhtPutIdentity { identity_id, published }) => {
+                    match published.entry().body() {
+                        TransactionBody::PublishV1 { transactions } => {
+                            let identity = match transactions.build_identity() {
+                                Ok(id) => id,
+                                Err(e) => {
+                                    warn!("kad: put identity: could not build identity: {}", e);
+                                    outgoing!{ Event::Error(e.into()) }
+                                    continue;
+                                }
+                            };
+                            match published.verify(Some(&identity)) {
+                                Ok(_) => {}
+                                Err(e) => {
+                                    warn!("kad: put identity: identity transaction did not verify. is it properly signed? -- {}", e);
+                                    outgoing!{ Event::Error(e.into()) }
+                                    continue;
+                                }
+                            }
+                            let serialized = match published.serialize_binary() {
+                                Ok(ser) => ser,
+                                Err(e) => {
+                                    warn!("kad: put identity: error serializing identity: {}", e);
+                                    outgoing!{ Event::Error(e.into()) }
+                                    continue;
+                                }
+                            };
+                            if serialized.len() > MAX_PUBLISHED_IDENTITY_SIZE {
+                                warn!("kad: put identity: published identity size {} is larger than storage threshold {}, peers will likely not publish and you will have to keep this node up indefinitely.", serialized.len(), MAX_PUBLISHED_IDENTITY_SIZE);
+                            }
+                            let record = kad::Record::new(Vec::from(format!("/identity/id/{}", identity_id).as_bytes()), serialized);
+                            match swarm.behaviour_mut().kad.put_record(record, kad::Quorum::Majority) {
+                                Ok(qid) => { kad_response_idx.insert(qid, Command::DhtPutIdentity { identity_id, published }); }
+                                Err(e) => {
+                                    warn!("kad: put identity: {:?}", e);
+                                    outgoing!{ Event::Error(e.into()) }
+                                    continue;
+                                }
+                            }
+                        }
+                        _ => {
+                            warn!("dht: put identity: bad transaction given -- {}", published.id());
+                            outgoing!{ Event::Error(Error::IdentityInvalid) }
+                        }
+                    }
+                }
+                Some(Command::DhtGetByEmail { email }) => {
+                    let key = kad::RecordKey::new(&format!("/identity/email/{}", email));
+                    let qid = swarm.behaviour_mut().kad.get_record(key);
+                    kad_response_idx.insert(qid, Command::DhtGetByEmail { email }); 
+                }
+                Some(Command::DhtPutByEmail { email, identity_id }) => {
+                    let serialized = Vec::from(identity_id.deref().as_bytes());
+                    let record = kad::Record::new(Vec::from(format!("/identity/email/{}", email).as_bytes()), serialized);
+                    match swarm.behaviour_mut().kad.put_record(record, kad::Quorum::Majority) {
+                        Ok(qid) => { kad_response_idx.insert(qid, Command::DhtPutByEmail { email, identity_id }); }
+                        Err(e) => {
+                            warn!("kad: put by email: {:?}", e);
+                            outgoing!{ Event::Error(e.into()) }
+                            continue;
+                        }
+                    }
+                }
+                Some(Command::DhtGetByName { name }) => {
+                    let key = kad::RecordKey::new(&format!("/identity/name/{}", name));
+                    let qid = swarm.behaviour_mut().kad.get_record(key);
+                    kad_response_idx.insert(qid, Command::DhtGetByName { name }); 
+                }
+                Some(Command::DhtPutByName { name, identity_id }) => {
+                    let serialized = Vec::from(identity_id.deref().as_bytes());
+                    let record = kad::Record::new(Vec::from(format!("/identity/name/{}", name).as_bytes()), serialized);
+                    match swarm.behaviour_mut().kad.put_record(record, kad::Quorum::Majority) {
+                        Ok(qid) => { kad_response_idx.insert(qid, Command::DhtPutByName { name, identity_id }); }
+                        Err(e) => {
+                            warn!("kad: put by name: {:?}", e);
+                            outgoing!{ Event::Error(e.into()) }
+                            continue;
+                        }
+                    }
+                }
                 Some(Command::TopicSend { topic: name, message }) => {
                     let topic = gossipsub::IdentTopic::new(name.as_str());
                     let len = message.len();
@@ -249,7 +354,8 @@ pub async fn run(mut swarm: Swarm<StampBehavior>, mut incoming: Receiver<Command
                         _ => {}
                     }
                     // we catch this on response and add providers
-                    swarm.behaviour_mut().kad.get_providers(key);
+                    let qid = swarm.behaviour_mut().kad.get_providers(key);
+                    kad_response_idx.insert(qid, Command::TopicSubscribe { topic: name }); 
                 }
                 Some(Command::TopicUnsubscribe { topic: name }) => {
                     let topic = gossipsub::IdentTopic::new(name.as_str());
@@ -330,30 +436,91 @@ pub async fn run(mut swarm: Swarm<StampBehavior>, mut incoming: Receiver<Command
                         outgoing!{ Event::DiscoveryReady }
                     }
                 }
-                SwarmEvent::Behaviour(StampEvent::Kad(kad::Event::OutboundQueryProgressed {id: _id, result: kad::QueryResult::GetProviders(Ok(kad::GetProvidersOk::FoundProviders { key, providers })), step: _step, stats: _stats})) => {
-                    for provider in providers.iter() {
-                        if provider == swarm.local_peer_id() {
-                            continue;
-                        }
-                        info!("gossip: add peer from kad: {:?} -- {:?}", key, provider);
-                        swarm.behaviour_mut().gossipsub.add_explicit_peer(&provider);
-                        let addresses = swarm.connected_peers()
-                            .map(|p| {
-                                Multiaddr::empty()
-                                    .with(multiaddr::Protocol::P2p(p.clone()))
-                                    .with(multiaddr::Protocol::P2pCircuit)
-                                    .with(multiaddr::Protocol::P2p(provider.clone()))
-                            })
-                            .collect::<Vec<_>>();
-                        for addr in addresses {
-                            info!("gossip: dialing {:?}", addr);
-                            match swarm.dial(addr.clone()) {
-                                Ok(_) => {}
-                                Err(e) => {
-                                    outgoing!{ Event::Error(Error::DialError(e)) }
+                SwarmEvent::Behaviour(StampEvent::Kad(kad::Event::OutboundQueryProgressed {id: qid, result, step: _step, stats: _stats})) => {
+                    match kad_response_idx.get(&qid) {
+                        Some(cmd) => {
+                            match (cmd, result) {
+                                (Command::DhtGetIdentity { identity_id }, kad::QueryResult::GetRecord(rec_res)) => {
+                                    match rec_res {
+                                        Ok(kad::GetRecordOk::FoundRecord(record)) => {
+                                            let published = match Transaction::deserialize_binary(record.record.value.as_slice()) {
+                                                Ok(trans) => trans,
+                                                Err(e) => {
+                                                    outgoing! { Event::Error(e.into()) }
+                                                    continue;
+                                                }
+                                            };
+                                            match published.entry().body() {
+                                                TransactionBody::PublishV1 { transactions } => {
+                                                    let identity = match transactions.build_identity() {
+                                                        Ok(id) => id,
+                                                        Err(e) => {
+                                                            warn!("kad: get identity: could not build identity {}: {}", identity_id, e);
+                                                            outgoing!{ Event::Error(e.into()) }
+                                                            continue;
+                                                        }
+                                                    };
+                                                    match published.verify(Some(&identity)) {
+                                                        Ok(_) => {}
+                                                        Err(e) => {
+                                                            warn!("kad: get identity: identity transaction for {} did not verify. is it properly signed? -- {}", identity_id, e);
+                                                            outgoing!{ Event::Error(e.into()) }
+                                                            continue;
+                                                        }
+                                                    }
+                                                }
+                                                _ => {}
+                                            }
+                                            outgoing! { Event::IdentityFound{ identity_id: identity_id.clone(), published } };
+                                        }
+                                        Ok(kad::GetRecordOk::FinishedWithNoAdditionalRecord { .. }) => {
+                                            outgoing! { Event::IdentityNotFound(identity_id.clone()) };
+                                        }
+                                        Err(e) => {
+                                            outgoing! { Event::Error(Error::Kad(format!("kad: get identity: {}", e))) };
+                                        }
+                                    }
                                 }
+                                (Command::DhtPutIdentity { identity_id, .. }, kad::QueryResult::PutRecord(put_res)) => {
+                                    match put_res {
+                                        Ok(..) => {
+                                            outgoing! { Event::IdentityStored(identity_id.clone()) };
+                                        }
+                                        Err(e) => {
+                                            outgoing! { Event::Error(Error::Kad(format!("kad: put identity: {}", e))) };
+                                        }
+                                    }
+                                }
+                                (Command::TopicSubscribe { .. }, kad::QueryResult::GetProviders(Ok(kad::GetProvidersOk::FoundProviders { key, providers }))) => {
+                                    for provider in providers.iter() {
+                                        if provider == swarm.local_peer_id() {
+                                            continue;
+                                        }
+                                        info!("gossip: add peer from kad: {:?} -- {:?}", key, provider);
+                                        swarm.behaviour_mut().gossipsub.add_explicit_peer(&provider);
+                                        let addresses = swarm.connected_peers()
+                                            .map(|p| {
+                                                Multiaddr::empty()
+                                                    .with(multiaddr::Protocol::P2p(p.clone()))
+                                                    .with(multiaddr::Protocol::P2pCircuit)
+                                                    .with(multiaddr::Protocol::P2p(provider.clone()))
+                                            })
+                                        .collect::<Vec<_>>();
+                                        for addr in addresses {
+                                            info!("gossip: dialing {:?}", addr);
+                                            match swarm.dial(addr.clone()) {
+                                                Ok(_) => {}
+                                                Err(e) => {
+                                                    outgoing!{ Event::Error(Error::DialError(e)) }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                _ => {}
                             }
                         }
+                        None => {}
                     }
                 }
                 SwarmEvent::Behaviour(StampEvent::Ping(ev)) => {
