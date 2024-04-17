@@ -24,6 +24,10 @@ pub enum Error {
     // NOTE: cannot figure out how to #[from] this, so just going to stringify it for now...
     BehaviorError(String),
 
+    /// A channel was closed, probably unexpectedly.
+    #[error("channel closed unexpectedly")]
+    ChannelClosed,
+
     /// Channel send error
     #[error("channel send: {0}")]
     ChannelSend(String),
@@ -35,6 +39,35 @@ pub enum Error {
     /// A command timed out. Sorry. Try a better command.
     #[error("command timed out")]
     CommandTimeout,
+
+    /// DHT error
+    #[error("DHT failure: {0}")]
+    DHT(String),
+
+    /// DHT bootstrapping error
+    #[error("DHT bootstrap failure")]
+    DHTBootstrap,
+
+    /// Tried to run a DHT operation but we have no peers
+    #[error("DHT has no peers")]
+    DHTNoPeers,
+
+    /// DHT failed to lookup a value
+    #[error("DHT lookup failed")]
+    DHTLookupFailed {
+        num_requests: u32,
+        num_successes: u32,
+        num_failures: u32,
+        closest_peers: Vec<libp2p::PeerId>,
+    },
+
+    /// DHT record error
+    #[error("DHT record error: {0}")]
+    DHTRecord(#[from] libp2p::kad::store::Error),
+
+    /// Quorum failed while putting a record
+    #[error("DHT quorum failure while storing record")]
+    DHTPutQuorumFailed,
 
     /// Error dialing
     #[error("swarm dial error: {0}")]
@@ -56,21 +89,9 @@ pub enum Error {
     #[error("invalid identity, must be a PublishV1 transaction")]
     IdentityInvalid,
 
-    /// Kad error
-    #[error("kad failure: {0}")]
-    Kad(String),
-
-    /// Kad bootstrapping error
-    #[error("kademlia bootstrap failure")]
-    KadBootstrap,
-
-    /// Kad record error
-    #[error("kademlia record error: {0}")]
-    KadRecord(#[from] libp2p::kad::store::Error),
-
-    /// Quorum failed while putting a record
-    #[error("kademlia quorum failure while storing record")]
-    KadPutQuorumFailed,
+    /// Your identity has too many bytes.
+    #[error("identity is too large to be reasonably stored by the network")]
+    IdentityTooLarge,
 
     /// An IO error
     #[error("io error: {0}")]
