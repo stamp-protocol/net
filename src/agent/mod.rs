@@ -750,49 +750,28 @@ impl Agent {
         res?;
         if self.relay_mode == RelayMode::Server {
             // mark us as a relay provider...
-            match self.run_command(Command::KadStartProvide("/stampnet/relay/provider".into())).await {
-                Ok(mut rx) => match rx.recv().await {
-                    Some(CommandResult::Ok(Some(StampEvent::Kad(kad::Event::OutboundQueryProgressed {
-                        result: kad::QueryResult::StartProviding(res),
-                        ..
-                    })))) => match res {
-                        Ok(_) => {
-                            info!("dht_bootstrap() -- successfully advertised node as relay");
-                        }
-                        Err(e) => warn!("dht_bootstrap() -- error advertising node as relay: {:?}", e),
-                    },
-                    Some(CommandResult::Ok(x)) => {
-                        warn!("dht_bootstrap() -- weirdness advertising node as relay (unexpected return): {:?}", x)
-                    }
-                    Some(CommandResult::Err(e)) => warn!("dht_bootstrap() -- error advertising node as relay: {}", e),
-                    None => warn!("dht_bootstrap() -- channel closed while advertising node as relay"),
-                },
-                Err(e) => warn!("error advertising node as relay: {}", e),
-            };
+            self.dht_provide("/stampnet/relay/provider".into()).await?;
+            info!("dht_bootstrap() -- successfully advertised node as relay");
         }
         Ok(())
     }
 
     /// Ask the DHT to mark us as a provider for something.
     #[tracing::instrument(skip(self))]
-    pub async fn dht_provide(&self, resource: String) -> Result<StampEvent> {
+    pub async fn dht_provide(&self, resource: String) -> Result<()> {
         let mut rx = self.run_command(Command::KadStartProvide(resource)).await?;
-        let ev = match rx.recv().await.ok_or(Error::ChannelClosed)? {
-            CommandResult::Ok(Some(ev)) => {
-                match ev {
-                    StampEvent::Kad(kad::Event::OutboundQueryProgressed {
-                        result: kad::QueryResult::StartProviding(Ok(_)),
-                        ..
-                    }) => {}
-                    _ => Err(Error::CommandGeneric(format!("failed to start providing: {:?}", ev)))?,
-                }
-                // TODO: verify that we have a success response in the kad event itself
-                ev
-            }
+        match rx.recv().await.ok_or(Error::ChannelClosed)? {
+            CommandResult::Ok(Some(ev)) => match ev {
+                StampEvent::Kad(kad::Event::OutboundQueryProgressed {
+                    result: kad::QueryResult::StartProviding(Ok(_)),
+                    ..
+                }) => {}
+                _ => Err(Error::CommandGeneric(format!("failed to start providing: {:?}", ev)))?,
+            },
             CommandResult::Ok(None) => Err(Error::CommandGeneric("blank response, expected event".into()))?,
             CommandResult::Err(e) => Err(e)?,
-        };
-        Ok(ev)
+        }
+        Ok(())
     }
 
     /// Ask the DHT to stop providing on our behalf.
