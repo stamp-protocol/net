@@ -758,7 +758,7 @@ impl Agent {
 
     /// Ask the DHT to mark us as a provider for something.
     #[tracing::instrument(skip(self))]
-    pub async fn dht_provide(&self, resource: String) -> Result<()> {
+    async fn dht_provide(&self, resource: String) -> Result<()> {
         let mut rx = self.run_command(Command::KadStartProvide(resource)).await?;
         match rx.recv().await.ok_or(Error::ChannelClosed)? {
             CommandResult::Ok(Some(ev)) => match ev {
@@ -776,7 +776,8 @@ impl Agent {
 
     /// Ask the DHT to stop providing on our behalf.
     #[tracing::instrument(skip(self))]
-    pub async fn dht_stop_providing(&self, resource: String) -> Result<()> {
+    #[allow(dead_code)]
+    async fn dht_stop_providing(&self, resource: String) -> Result<()> {
         let mut rx = self.run_command(Command::KadStopProvide(resource)).await?;
         match rx.recv().await.ok_or(Error::ChannelClosed)? {
             CommandResult::Ok(_) => {}
@@ -909,7 +910,9 @@ impl Agent {
         Ok(peers)
     }
 
-    /// Get the connected peers to this node.
+    /// Start talking to some peers.
+    ///
+    /// "Pardon me, may I use your bathroom?? Thank you!!"
     #[tracing::instrument(skip(self))]
     pub async fn dial_peers(&self, peers: Vec<Multiaddr>) -> Result<()> {
         let mut rx = self.run_command(Command::Dial(peers)).await?;
