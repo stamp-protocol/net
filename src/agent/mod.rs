@@ -11,11 +11,7 @@ use libp2p::{
     swarm::{behaviour::toggle::Toggle, SwarmEvent},
     tcp, yamux, Multiaddr, PeerId, Swarm,
 };
-use stamp_core::{
-    dag::Transaction,
-    identity::IdentityID,
-    util::SerdeBinary,
-};
+use stamp_core::{dag::Transaction, identity::IdentityID, util::SerdeBinary};
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Mutex};
