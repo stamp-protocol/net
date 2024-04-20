@@ -1,16 +1,18 @@
+mod behavior;
+
+pub use behavior::*;
+
 use crate::error::{Error, Result};
 use chrono::Utc;
 use futures::{prelude::*, select};
 pub use libp2p::kad::Quorum;
 use libp2p::{
-    dcutr, identify, identity,
-    kad::{self, store::RecordStore},
-    multiaddr, noise, ping, relay,
+    dcutr, identify, identity, kad, multiaddr, noise, ping, relay,
     swarm::{behaviour::toggle::Toggle, SwarmEvent},
     tcp, yamux, Multiaddr, PeerId, Swarm,
 };
 use stamp_core::{
-    dag::{Transaction, TransactionBody},
+    dag::Transaction,
     identity::IdentityID,
     util::SerdeBinary,
 };
@@ -93,105 +95,34 @@ impl CommandContainer {
     }
 }
 
-/// NOTE: The only reason this module exists is because `#[derive(NetworkBehavior)]` does not
-/// namespace `Result` which pollutes the symbol table. The choice is to rename *our* result or to
-/// put the behavior into a submodule.
-mod behavior {
-    use libp2p::{
-        dcutr, identify, kad, ping, relay,
-        swarm::{behaviour::toggle::Toggle, NetworkBehaviour},
-        PeerId,
-    };
-
-    #[derive(NetworkBehaviour)]
-    #[behaviour(to_swarm = "StampEvent")]
-    pub struct StampBehavior {
-        pub(crate) dcutr: Toggle<dcutr::Behaviour>,
-        pub(crate) identify: identify::Behaviour,
-        pub(crate) kad: kad::Behaviour<kad::store::MemoryStore>,
-        pub(crate) ping: ping::Behaviour,
-        pub(crate) relay_client: Toggle<relay::client::Behaviour>,
-        pub(crate) relay: Toggle<relay::Behaviour>,
-    }
-
-    #[derive(Debug)]
-    pub enum StampEvent {
-        Dcutr(dcutr::Event),
-        Identify(identify::Event),
-        Kad(kad::Event),
-        PeerList(Vec<PeerId>),
-        Ping(ping::Event),
-        Relay(relay::Event),
-        RelayClient(relay::client::Event),
-    }
-
-    impl From<dcutr::Event> for StampEvent {
-        fn from(event: dcutr::Event) -> Self {
-            Self::Dcutr(event)
-        }
-    }
-
-    impl From<identify::Event> for StampEvent {
-        fn from(event: identify::Event) -> Self {
-            Self::Identify(event)
-        }
-    }
-
-    impl From<kad::Event> for StampEvent {
-        fn from(event: kad::Event) -> Self {
-            Self::Kad(event)
-        }
-    }
-
-    impl From<ping::Event> for StampEvent {
-        fn from(event: ping::Event) -> Self {
-            Self::Ping(event)
-        }
-    }
-
-    impl From<relay::Event> for StampEvent {
-        fn from(event: relay::Event) -> Self {
-            Self::Relay(event)
-        }
-    }
-
-    impl From<relay::client::Event> for StampEvent {
-        fn from(event: relay::client::Event) -> Self {
-            Self::RelayClient(event)
-        }
-    }
-}
-pub use behavior::*;
-
 /// Generate a new random peer key.
 pub fn random_peer_key() -> identity::Keypair {
     identity::Keypair::generate_ed25519()
 }
 
-fn validate_publish_transaction(publish_transaction: &Transaction) -> Result<IdentityID> {
-    match publish_transaction.entry().body() {
-        TransactionBody::PublishV1 { transactions } => {
-            let identity = transactions.build_identity()?;
-            publish_transaction.verify(Some(&identity))?;
-            Ok(identity.id().clone())
-        }
-        _ => Err(Error::IdentityInvalid),
-    }
+/// Create a store that puts values into memory (volatile across restarts).
+pub fn memory_store(peer_id: &PeerId) -> kad::store::MemoryStore {
+    let mut store_config = kad::store::MemoryStoreConfig::default();
+    store_config.max_value_bytes = MAX_DHT_RECORD_SIZE;
+    kad::store::MemoryStore::with_config(peer_id.clone(), store_config)
 }
 
-pub struct Agent {
+pub struct Agent<S: kad::store::RecordStore + Send + 'static> {
     relay_mode: RelayMode,
-    swarm: Mutex<Swarm<StampBehavior>>,
+    swarm: Mutex<Swarm<StampBehavior<S>>>,
     event_send: mpsc::Sender<Event>,
     request_tracker: Mutex<HashMap<RequestID, (bool, i64, mpsc::Sender<CommandResult>)>>,
     cmd_send: mpsc::Sender<CommandContainer>,
     cmd_recv: Mutex<mpsc::Receiver<CommandContainer>>,
 }
 
-impl Agent {
+impl<S: kad::store::RecordStore + Send + 'static> Agent<S> {
     /// Create a new agent.
-    #[tracing::instrument(skip(local_key))]
-    pub fn new(local_key: identity::Keypair, relay_mode: RelayMode, dht_mode: DHTMode) -> Result<(Self, mpsc::Receiver<Event>)> {
+    #[tracing::instrument(skip(local_key, store))]
+    pub fn new(local_key: identity::Keypair, store: S, relay_mode: RelayMode, dht_mode: DHTMode) -> Result<(Self, mpsc::Receiver<Event>)>
+    where
+        S: kad::store::RecordStore,
+    {
         let local_pubkey = local_key.public();
         let local_peer_id = PeerId::from(local_key.public());
         info!("Local peer id: {:?}", local_peer_id);
@@ -208,9 +139,6 @@ impl Agent {
         };
 
         let kad = {
-            let mut store_config = kad::store::MemoryStoreConfig::default();
-            store_config.max_value_bytes = MAX_DHT_RECORD_SIZE;
-            let store = kad::store::MemoryStore::with_config(local_peer_id.clone(), store_config);
             let mut config = kad::Config::default();
             config
                 .set_replication_factor(std::num::NonZeroUsize::new(20).unwrap())
@@ -475,7 +403,8 @@ impl Agent {
                         }
                         Command::IdentityPublish { publish_transaction, quorum } => {
                             let process_identity = || {
-                                let identity_id = validate_publish_transaction(&publish_transaction)?;
+                                let (_, identity) = publish_transaction.clone().validate_publish_transaction()?;
+                                let identity_id = identity.id().clone();
                                 let serialized = publish_transaction.serialize_binary()?;
                                 Ok((identity_id, serialized))
                             };
@@ -567,7 +496,7 @@ impl Agent {
                             request_id_mapper.maintenance(now);
                         }
                         Command::Quit => {
-                            info!("I QUIT!");
+                            info!("quitting");
                             respond! { &req_id, CommandResult::Ok(None) }
                             send_event! { Event::Quit }
                             break 'run;
@@ -659,8 +588,9 @@ impl Agent {
                                 }
                                 match Transaction::deserialize_binary(&record.value) {
                                     Ok(trans) => {
-                                        match validate_publish_transaction(&trans) {
-                                            Ok(identity_id_validated) => {
+                                        match trans.validate_publish_transaction() {
+                                            Ok((_, identity)) => {
+                                                let identity_id_validated = identity.id().clone();
                                                 let identity_id = key_string.strip_prefix("/stampnet/publish/identity/");
                                                 let id_validated = format!("{}", identity_id_validated);
                                                 if Some(id_validated.as_str()) != identity_id {
@@ -751,7 +681,7 @@ impl Agent {
         if self.relay_mode == RelayMode::Server {
             // mark us as a relay provider...
             self.dht_provide("/stampnet/relay/provider".into()).await?;
-            info!("dht_bootstrap() -- successfully advertised node as relay");
+            info!("successfully advertised node as relay");
         }
         Ok(())
     }
@@ -877,7 +807,7 @@ impl Agent {
                         String::from_utf8(record.key.to_vec()).map_err(|e| Error::DHT(format!("error converting kad key: {:?}", e)))?;
                     info!("identity record at {} provided by {:?}", key, peer);
                     let trans = Transaction::deserialize_binary(&record.value)?;
-                    validate_publish_transaction(&trans)?;
+                    trans.clone().validate_publish_transaction()?;
                     Some(trans)
                 }
                 kad::GetRecordOk::FinishedWithNoAdditionalRecord { .. } => None,

@@ -6,4 +6,7 @@ pub mod agent;
 pub mod error;
 
 pub use crate::error::Error;
-pub use libp2p::multiaddr::{Multiaddr, Protocol};
+pub use libp2p::{
+    multiaddr::{Multiaddr, Protocol},
+    PeerId,
+};

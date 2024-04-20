@@ -8,7 +8,7 @@ use stamp_core::{
     util::Timestamp,
 };
 use stamp_net::{
-    agent::{Agent, DHTMode, Event, RelayMode},
+    agent::{self, random_peer_key, Agent, DHTMode, Event, RelayMode},
     Multiaddr,
 };
 use std::sync::Arc;
@@ -23,6 +23,12 @@ pub fn setup() {
         .with(EnvFilter::try_from_default_env().or_else(|_| EnvFilter::try_new("info")).unwrap())
         .try_init()
         .unwrap_or_else(|_| ())
+}
+
+pub fn agent(relay_mode: RelayMode, dht_mode: DHTMode) -> (Agent<libp2p::kad::store::MemoryStore>, mpsc::Receiver<Event>) {
+    let key = random_peer_key();
+    let peer_id = libp2p::PeerId::from(key.public());
+    Agent::new(key, agent::memory_store(&peer_id), relay_mode, dht_mode).unwrap()
 }
 
 pub async fn node_event_sink(node: &TestNode) {
@@ -120,7 +126,7 @@ pub fn create_fake_identity_deterministic(now: Timestamp, seed: &[u8]) -> (Secre
 
 #[derive(Clone)]
 pub struct TestNode {
-    pub agent: Arc<Agent>,
+    pub agent: Arc<Agent<libp2p::kad::store::MemoryStore>>,
     pub multiaddr: Multiaddr,
     pub peer_id: libp2p::PeerId,
     pub events: Arc<RwLock<mpsc::Receiver<Event>>>,
@@ -140,7 +146,8 @@ where
         );
         let peer_id = libp2p::identity::Keypair::ed25519_from_bytes(&mut peer_key_bytes).unwrap();
         let peer_id_pub = libp2p::PeerId::from(peer_id.public());
-        let (agent, events) = Agent::new(peer_id, relay_mode.clone(), dht_mode.clone()).unwrap();
+        let store = agent::memory_store(&peer_id_pub);
+        let (agent, events) = Agent::new(peer_id, store, relay_mode.clone(), dht_mode.clone()).unwrap();
         let multiaddr: Multiaddr = addr_tpl(i).as_str().parse().unwrap();
         let agent = Arc::new(agent);
         nodes.push(TestNode {

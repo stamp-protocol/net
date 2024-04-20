@@ -7,7 +7,7 @@ use stamp_core::{
     util::Timestamp,
 };
 use stamp_net::{
-    agent::{random_peer_key, Agent, DHTMode, Quorum, RelayMode},
+    agent::{DHTMode, Quorum, RelayMode},
     error::Error,
     Multiaddr,
 };
@@ -41,8 +41,8 @@ async fn starts_quits() {
 #[tokio::test]
 async fn bind_error() {
     common::setup();
-    let (agent1, _ev1) = Agent::new(random_peer_key(), RelayMode::None, DHTMode::Client).unwrap();
-    let (agent2, _ev2) = Agent::new(random_peer_key(), RelayMode::None, DHTMode::Client).unwrap();
+    let (agent1, _ev1) = common::agent(RelayMode::None, DHTMode::Client);
+    let (agent2, _ev2) = common::agent(RelayMode::None, DHTMode::Client);
     // purposefully give them the same binding
     let agent1_addr: Multiaddr = "/ip4/127.0.0.1/tcp/40019".parse().unwrap();
     let agent2_addr: Multiaddr = "/ip4/127.0.0.1/tcp/40019".parse().unwrap();
