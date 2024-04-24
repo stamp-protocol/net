@@ -156,7 +156,7 @@ async fn identity_too_large_store_locally() {
 
         for node in nodes2.iter() {
             let not_found = node.agent.lookup_identity(identity_id.clone()).await;
-            assert!(matches!(not_found, Err(Error::DHTLookupFailed { .. })));
+            assert!(matches!(not_found, Ok(None)));
         }
 
         for node in nodes2.iter() {

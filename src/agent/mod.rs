@@ -809,15 +809,9 @@ impl<S: kad::store::RecordStore + Send + 'static> Agent<S> {
                 kad::GetRecordOk::FinishedWithNoAdditionalRecord { .. } => None,
             },
             CommandResult::Ok(Some(StampEvent::Kad(kad::Event::OutboundQueryProgressed {
-                result: kad::QueryResult::GetRecord(Err(kad::GetRecordError::NotFound { closest_peers, .. })),
-                stats,
+                result: kad::QueryResult::GetRecord(Err(kad::GetRecordError::NotFound { .. })),
                 ..
-            }))) => Err(Error::DHTLookupFailed {
-                closest_peers,
-                num_requests: stats.num_requests(),
-                num_successes: stats.num_successes(),
-                num_failures: stats.num_failures(),
-            })?,
+            }))) => None,
             CommandResult::Ok(e) => Err(Error::CommandGeneric(format!("lookup failure: {:?}", e)))?,
             CommandResult::Err(e) => Err(e)?,
         };

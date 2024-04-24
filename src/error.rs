@@ -52,15 +52,6 @@ pub enum Error {
     #[error("DHT has no peers")]
     DHTNoPeers,
 
-    /// DHT failed to lookup a value
-    #[error("DHT lookup failed")]
-    DHTLookupFailed {
-        num_requests: u32,
-        num_successes: u32,
-        num_failures: u32,
-        closest_peers: Vec<libp2p::PeerId>,
-    },
-
     /// DHT record error
     #[error("DHT record error: {0}")]
     DHTRecord(#[from] libp2p::kad::store::Error),
